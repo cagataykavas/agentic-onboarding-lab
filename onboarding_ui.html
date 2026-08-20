@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic Onboarding Prototype</title>
+  <style>
+    :root {
+      --bg:#f3f6fb; --card:#fff; --ink:#0d1b2a; --muted:#68778a; --line:#dbe4ef;
+      --accent:#ff6b2c; --accent2:#ff9c42; --good:#138a5b; --soft:#fff3ec;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#fff 0,#f5f8fc 30%,#eef3f9 100%);color:var(--ink)}
+    .shell{max-width:1180px;margin:auto;padding:28px 22px 80px}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:42px}.logo{font-weight:900;letter-spacing:-.04em;font-size:22px}.logo i{font-style:normal;color:var(--accent)}
+    .secure{font-size:13px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 320px;gap:28px}.main,.aside{background:var(--card);border:1px solid var(--line);border-radius:24px;box-shadow:0 18px 50px rgba(36,55,80,.08)}
+    .main{padding:34px}.aside{padding:24px;height:max-content}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.16em;color:var(--accent);font-weight:800}
+    h1{font-size:38px;line-height:1.08;letter-spacing:-.05em;margin:10px 0 12px}p{color:var(--muted);line-height:1.7}
+    .progress{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:30px 0 34px}.step{height:7px;background:#e8edf4;border-radius:999px}.step.done{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+    .question{border-top:1px solid var(--line);padding-top:28px}.question h2{font-size:22px;margin:0 0 8px}.field{margin:18px 0}.field label{display:block;font-weight:700;margin-bottom:8px}.field input,.field select{width:100%;padding:14px 15px;border:1px solid #cbd7e4;border-radius:12px;font-size:15px;background:white}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.btn{border:0;border-radius:13px;padding:14px 20px;font-weight:800;font-size:15px;cursor:pointer}.primary{background:var(--accent);color:white}.ghost{background:#f2f5f9;color:var(--ink)}
+    .agent-card{margin-top:24px;border:1px solid #ffd9c8;background:var(--soft);padding:16px;border-radius:15px;display:grid;grid-template-columns:auto 1fr;gap:12px}.agent-icon{width:34px;height:34px;border-radius:10px;background:var(--accent);display:grid;place-items:center;color:white;font-weight:900}.agent-card strong{display:block}.agent-card p{font-size:13px;margin:4px 0 0}
+    .aside h3{margin:0 0 16px;font-size:16px}.check{display:flex;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}.check:last-child{border-bottom:0}.check b{width:23px;height:23px;border-radius:999px;background:#e8f7f0;color:var(--good);display:grid;place-items:center;font-size:12px}.check span{font-size:13px}.check small{display:block;color:var(--muted);margin-top:3px}
+    .privacy{margin-top:20px;padding:14px;border-radius:14px;background:#f6f8fb;font-size:12px;color:var(--muted);line-height:1.6}
+    .status{margin-top:22px;display:flex;align-items:center;gap:9px;color:var(--good);font-size:13px;font-weight:700}.dot{width:8px;height:8px;border-radius:50%;background:var(--good)}
+    @media(max-width:800px){.grid{grid-template-columns:1fr}.aside{order:-1}.row{grid-template-columns:1fr}h1{font-size:31px}.main{padding:24px}}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header><div class="logo">Onboard<i>AI</i></div><div class="secure">🔒 Secure onboarding · prototype</div></header>
+  <div class="grid">
+    <main class="main">
+      <div class="eyebrow">Step 3 of 5 · Profile</div>
+      <h1>Almost there. We only need what’s missing.</h1>
+      <p>The agent reuses information already verified from your identity evidence, so you do not have to type the same details twice.</p>
+      <div class="progress"><div class="step done"></div><div class="step done"></div><div class="step done"></div><div class="step"></div><div class="step"></div></div>
+      <section class="question">
+        <h2>Tell us about your work</h2>
+        <p>This helps complete the profile and determine which checks are relevant.</p>
+        <div class="row">
+          <div class="field"><label>Occupation</label><input id="occupation" value="Engineer" /></div>
+          <div class="field"><label>Employment type</label><select><option>Employed</option><option>Self-employed</option><option>Student</option></select></div>
+        </div>
+        <div class="field"><label>Country of residence</label><input value="Türkiye" /></div>
+        <div class="agent-card"><div class="agent-icon">AI</div><div><strong>Why am I asking this?</strong><p>Your name, date of birth and address are already verified. Occupation is the only required profile field still missing, so the agent skipped three redundant questions.</p></div></div>
+        <div style="display:flex;justify-content:space-between;gap:10px;margin-top:28px"><button class="btn ghost">Back</button><button class="btn primary" onclick="continueFlow()">Continue</button></div>
+      </section>
+    </main>
+    <aside class="aside">
+      <h3>Your onboarding progress</h3>
+      <div class="check"><b>✓</b><span>Consent<small>Captured</small></span></div>
+      <div class="check"><b>✓</b><span>Identity<small>Verified · confidence 0.97</small></span></div>
+      <div class="check"><b>✓</b><span>Address<small>Verified from synthetic registry</small></span></div>
+      <div class="check"><b>3</b><span>Profile<small>1 field remaining</small></span></div>
+      <div class="check"><b>4</b><span>Risk screening<small>Not started</small></span></div>
+      <div class="privacy">The prototype separates the agent planner from policy rules. High-impact or ambiguous cases are routed to a human reviewer rather than auto-approved.</div>
+      <div class="status"><span class="dot"></span><span id="status">No human review required yet</span></div>
+    </aside>
+  </div>
+</div>
+<script>
+function continueFlow(){
+  const occupation=document.getElementById('occupation').value.trim();
+  const status=document.getElementById('status');
+  if(!occupation){ status.textContent='Occupation is still missing'; status.style.color='#b45309'; return; }
+  status.textContent='Profile complete · next: risk screening';
+  document.querySelector('.question h2').textContent='Profile complete';
+  document.querySelector('.question p').textContent='The orchestration layer would now start policy-controlled risk screening.';
+}
+</script>
+</body>
+</html>
