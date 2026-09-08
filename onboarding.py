@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Iterable
 
 
 class Stage(str, Enum):
@@ -72,6 +72,8 @@ class OnboardingCase:
     risk_flags: set[str] = field(default_factory=set)
     human_review_required: bool = False
     decision_reason: str | None = None
+    decision_outcome: str | None = None
+    version: int = 0
     audit: list[AuditEvent] = field(default_factory=list)
 
     def add_evidence(self, record: EvidenceRecord) -> None:
@@ -146,9 +148,7 @@ class OnboardingPolicy:
             return True
         if self.mandatory_review_flags & case.risk_flags:
             return True
-        if any(item.status is EvidenceStatus.CONFLICT for item in case.evidence):
-            return True
-        return False
+        return any(item.status is EvidenceStatus.CONFLICT for item in case.evidence)
 
 
 class OnboardingAgent:
@@ -164,7 +164,7 @@ class OnboardingAgent:
         self._event_counter = 0
 
     def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
     def _record(
         self,
@@ -327,6 +327,8 @@ class OnboardingAgent:
         confidence: float,
         conflict: bool = False,
     ) -> TransitionResult:
+        if case.stage not in {Stage.PROFILE_PENDING, Stage.NEEDS_CUSTOMER_INPUT}:
+            raise ValueError("address evidence is not expected at this stage")
         record = EvidenceRecord(
             evidence_id=f"address-{len(case.evidence) + 1}",
             kind="address",
@@ -377,6 +379,22 @@ class OnboardingAgent:
                 "We only need the remaining profile details.",
                 "collect_profile",
                 tuple(missing),
+            )
+
+        # Conflicting evidence is itself the reason to defer. Requiring it to pass
+        # normal validation first would strand the case before the review route.
+        if self.policy.requires_human_review(case):
+            self._transition(
+                case,
+                Stage.HUMAN_REVIEW,
+                actor=Actor.SYSTEM,
+                event_type="case_escalated",
+                details={"risk_flags": sorted(case.risk_flags)},
+            )
+            return TransitionResult(
+                case.stage,
+                "A specialist will review the conflicting evidence.",
+                "human_review",
             )
 
         if not self.policy.address_valid(case):
@@ -442,6 +460,7 @@ class OnboardingAgent:
 
         final_stage = Stage.APPROVED if approve else Stage.REJECTED
         case.decision_reason = reason
+        case.decision_outcome = "approved" if approve else "rejected"
         self._transition(
             case,
             final_stage,
@@ -455,6 +474,7 @@ class OnboardingAgent:
         if case.stage not in {Stage.APPROVED, Stage.REJECTED}:
             raise ValueError("only a decided case can be completed")
         outcome = "approved" if case.stage is Stage.APPROVED else "rejected"
+        case.decision_outcome = outcome
         self._transition(
             case,
             Stage.COMPLETED,

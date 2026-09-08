@@ -17,12 +17,20 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: ruff check onboarding.py service tests
+      - run: ruff check .
       - run: pytest -q
       - run: python onboarding.py
+      - run: python -m build
+      - name: Verify wheel outside source tree
+        run: |
+          python -m venv /tmp/onboarding-wheel
+          cd /tmp
+          /tmp/onboarding-wheel/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl
+          /tmp/onboarding-wheel/bin/python -c "from service.api import app; assert app.title"
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t agentic-onboarding-platform:ci .
+      - run: docker run --rm agentic-onboarding-platform:ci python -c "from service.api import app; assert app.version"

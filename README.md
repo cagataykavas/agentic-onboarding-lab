@@ -70,7 +70,8 @@ The agent **cannot** silently override mandatory-review policy, delete evidence,
 ```mermaid
 flowchart TB
     UI[Customer onboarding UI] --> ORCH[Onboarding orchestrator]
-    ORCH --> STATE[(Case state store)]
+    ORCH --> TX[Command transaction]
+    TX --> STATE[(Versioned case store)]
     ORCH --> AGENT[Agent planner]
     AGENT --> TOOLS[Allowed tools]
     TOOLS --> ID[Identity validation]
@@ -80,11 +81,28 @@ flowchart TB
     EVID --> POLICY[Policy router]
     POLICY -->|automate| RESULT[Outcome]
     POLICY -->|ask customer| UI
-    POLICY -->|escalate| REVIEW[Human reviewer]
+    POLICY -->|escalate| QUEUE[(SLA review queue)]
+    QUEUE --> REVIEW[Leased human review]
     REVIEW --> RESULT
     RESULT --> AUDIT[(Audit events)]
     RESULT --> OBS[Journey + service metrics]
 ```
+
+## Reliability contracts
+
+This implementation treats a state transition as a command, not a CRUD overwrite:
+
+- every case has a monotonically increasing `version`;
+- `If-Match` rejects decisions based on stale customer or reviewer screens;
+- state and the embedded audit event commit in the same SQLite transaction;
+- `Idempotency-Key` receipts make timeout retries safe without duplicate evidence or audit events;
+- escalation creates a durable review task in the same case transaction;
+- reviewers claim work through expiring leases, so abandoned tasks re-enter the queue;
+- queue order is deterministic: priority descending, then SLA deadline, then arrival time;
+- outcome is stored separately from the terminal `completed` stage.
+
+These boundaries remain useful if SQLite is replaced by PostgreSQL: the compare-and-swap update,
+command receipt and lease acquisition map directly to conditional updates and row locking.
 
 ## Important service-design metrics
 
@@ -99,19 +117,66 @@ flowchart TB
 - SLA breach rate;
 - automation rate by impact tier.
 
+`GET /metrics/journey` derives its current snapshot from case audit histories and durable queue
+records. It reports completion and human-review rates, automated/reviewer decisions, evidence
+density, stage distribution, queued/leased work and SLA breaches. Metrics are recomputable rather
+than increment-only counters that drift after retries.
+
+## API workflow
+
+```bash
+# create a case (version starts at 1)
+curl -s -X POST localhost:8000/cases \
+  -H 'content-type: application/json' \
+  -d '{"product":"Everyday Banking","customer_type":"retail"}'
+
+# retry-safe transition based on the version rendered to the customer
+curl -s -X POST localhost:8000/cases/ONB-.../consent \
+  -H 'content-type: application/json' \
+  -H 'If-Match: 1' \
+  -H 'Idempotency-Key: consent-ONB-...-1' \
+  -d '{"accepted":true}'
+
+# reviewer work distribution
+curl -s -X POST localhost:8000/reviews/claim \
+  -H 'content-type: application/json' \
+  -d '{"reviewer":"analyst-17","lease_minutes":15}'
+```
+
+A repeated idempotency key returns `idempotent_replay: true`. A stale version, reused key from
+another case, illegal state transition or invalid reviewer lease returns HTTP 409.
+
 ## Repository layout
 
 ```text
 agentic-onboarding-lab/
-├── onboarding.py       # state machine, evidence and orchestration
-├── onboarding_ui.html  # static customer journey prototype
-└── README.md
+├── onboarding.py          # policy-bounded state machine and evidence model
+├── service/
+│   ├── api.py             # HTTP command and reviewer-queue boundary
+│   ├── store.py           # transactional versioning and command receipts
+│   ├── reviews.py         # priority/SLA queue and expiring leases
+│   └── metrics.py         # audit-derived operational metrics
+├── tests/
+│   ├── test_api.py        # end-to-end customer and reviewer journeys
+│   ├── test_concurrency.py# stale-writer and thread-race regressions
+│   ├── test_reviews.py    # queue ordering, expiry and ownership
+│   └── test_metrics.py    # service KPI derivation
+├── onboarding_ui.html     # static customer journey prototype
+├── Dockerfile             # non-interactive production service image
+└── .github/workflows/ci.yml
 ```
 
 ## Demo
 
 ```bash
-python onboarding.py
+python -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/ruff check .
+.venv/bin/pytest -q
+.venv/bin/uvicorn service.api:app --reload
 ```
+
+CI also builds the wheel, installs it outside the repository, imports the installed API, builds
+the container and executes a container-level application import smoke test.
 
 All demo identities and evidence are synthetic. This project contains no real customer or employer information.
