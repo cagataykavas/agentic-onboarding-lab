@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
+import hashlib
+import json
 import os
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from onboarding import OnboardingAgent, OnboardingCase, Stage
-from service.store import OnboardingRepository, case_to_dict
+from service.metrics import MetricsCalculator
+from service.reviews import ReviewQueue
+from service.store import (
+    IdempotencyConflict,
+    OnboardingRepository,
+    VersionConflict,
+    case_to_dict,
+)
 
 
 class CreateCaseRequest(BaseModel):
@@ -26,7 +35,7 @@ class IdentityRequest(BaseModel):
     source: str = Field(default="document_capture", min_length=2, max_length=120)
     confidence: float = Field(ge=0.0, le=1.0)
     valid: bool
-    missing_fields: list[str] = []
+    missing_fields: list[str] = Field(default_factory=list)
 
 
 class ProfileRequest(BaseModel):
@@ -46,13 +55,20 @@ class AddressEvidenceRequest(BaseModel):
 class ReviewerDecisionRequest(BaseModel):
     approve: bool
     reason: str = Field(min_length=5, max_length=1000)
+    reviewer: str = Field(default="reviewer-demo", min_length=2, max_length=120)
+
+
+class ClaimReviewRequest(BaseModel):
+    reviewer: str = Field(min_length=2, max_length=120)
+    lease_minutes: int = Field(default=15, ge=1, le=120)
 
 
 DATABASE_PATH = Path(os.getenv("ONBOARDING_DATABASE_PATH", "onboarding.db"))
 repository = OnboardingRepository(DATABASE_PATH)
+review_queue = ReviewQueue(repository)
 app = FastAPI(
     title="Agentic Onboarding Platform",
-    version="0.2.0",
+    version="0.3.0",
     description="Policy-bounded onboarding workflow with explicit human escalation and audit trails.",
 )
 
@@ -70,14 +86,61 @@ def _agent_for(case: OnboardingCase) -> OnboardingAgent:
     return agent
 
 
-def _persist_result(case: OnboardingCase, result) -> dict:
-    repository.upsert(case)
-    return {"case": case_to_dict(case), "transition": asdict(result)}
+def _fingerprint(action: str, payload: dict[str, object] | None = None) -> str:
+    canonical = json.dumps(
+        {"action": action, "payload": payload or {}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _mutate(
+    case_id: str,
+    operation,
+    expected_version: int | None,
+    idempotency_key: str | None,
+    command_fingerprint: str,
+    review_lease_owner: str | None = None,
+) -> dict:
+    try:
+        case, result = repository.mutate(
+            case_id,
+            operation,
+            expected_version=expected_version,
+            command_id=idempotency_key,
+            command_fingerprint=command_fingerprint,
+            review_lease_owner=review_lease_owner,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="case not found") from exc
+    except (VersionConflict, IdempotencyConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(result, dict) and result.get("idempotent_replay"):
+        return {
+            "case": case_to_dict(case),
+            "transition": result["transition"],
+            "idempotent_replay": True,
+        }
+    return {
+        "case": case_to_dict(case),
+        "transition": asdict(result),
+        "idempotent_replay": False,
+    }
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics/journey")
+def journey_metrics() -> dict[str, object]:
+    cases = repository.list(limit=500)
+    tasks = review_queue.list_all(limit=5000)
+    return MetricsCalculator().calculate(cases, tasks).to_dict()
 
 
 @app.post("/cases", status_code=201)
@@ -87,7 +150,7 @@ def create_case(request: CreateCaseRequest) -> dict:
         product=request.product,
         customer_type=request.customer_type,
     )
-    repository.upsert(case)
+    repository.create(case)
     return case_to_dict(case)
 
 
@@ -105,20 +168,30 @@ def get_case(case_id: str) -> dict:
 
 
 @app.post("/cases/{case_id}/consent")
-def capture_consent(case_id: str, request: ConsentRequest) -> dict:
-    case = _load(case_id)
-    try:
-        result = _agent_for(case).capture_consent(case, request.accepted)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _persist_result(case, result)
+def capture_consent(
+    case_id: str,
+    request: ConsentRequest,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    return _mutate(
+        case_id,
+        lambda case: _agent_for(case).capture_consent(case, request.accepted),
+        if_match,
+        idempotency_key,
+        _fingerprint("capture_consent", request.model_dump()),
+    )
 
 
 @app.post("/cases/{case_id}/identity")
-def submit_identity(case_id: str, request: IdentityRequest) -> dict:
-    case = _load(case_id)
-    try:
-        result = _agent_for(case).submit_identity(
+def submit_identity(
+    case_id: str,
+    request: IdentityRequest,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    def operation(case: OnboardingCase):
+        return _agent_for(case).submit_identity(
             case,
             value=request.value,
             source=request.source,
@@ -126,53 +199,101 @@ def submit_identity(case_id: str, request: IdentityRequest) -> dict:
             valid=request.valid,
             missing_fields=tuple(request.missing_fields),
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _persist_result(case, result)
+
+    return _mutate(
+        case_id,
+        operation,
+        if_match,
+        idempotency_key,
+        _fingerprint("submit_identity", request.model_dump()),
+    )
 
 
 @app.patch("/cases/{case_id}/profile")
-def update_profile(case_id: str, request: ProfileRequest) -> dict:
-    case = _load(case_id)
+def update_profile(
+    case_id: str,
+    request: ProfileRequest,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
     fields = {key: value for key, value in request.model_dump().items() if value is not None}
-    try:
-        result = _agent_for(case).update_profile(case, **fields)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _persist_result(case, result)
+    return _mutate(
+        case_id,
+        lambda case: _agent_for(case).update_profile(case, **fields),
+        if_match,
+        idempotency_key,
+        _fingerprint("update_profile", request.model_dump()),
+    )
 
 
 @app.post("/cases/{case_id}/address-evidence")
-def add_address_evidence(case_id: str, request: AddressEvidenceRequest) -> dict:
-    case = _load(case_id)
-    result = _agent_for(case).add_address_evidence(
-        case,
-        address=request.address,
-        confidence=request.confidence,
-        conflict=request.conflict,
+def add_address_evidence(
+    case_id: str,
+    request: AddressEvidenceRequest,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    return _mutate(
+        case_id,
+        lambda case: _agent_for(case).add_address_evidence(
+            case,
+            address=request.address,
+            confidence=request.confidence,
+            conflict=request.conflict,
+        ),
+        if_match,
+        idempotency_key,
+        _fingerprint("add_address_evidence", request.model_dump()),
     )
-    return _persist_result(case, result)
 
 
 @app.post("/cases/{case_id}/next")
-def next_step(case_id: str) -> dict:
-    case = _load(case_id)
-    result = _agent_for(case).next_step(case)
-    return _persist_result(case, result)
+def next_step(
+    case_id: str,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    return _mutate(
+        case_id,
+        lambda case: _agent_for(case).next_step(case),
+        if_match,
+        idempotency_key,
+        _fingerprint("next_step"),
+    )
 
 
 @app.post("/cases/{case_id}/review")
-def review(case_id: str, request: ReviewerDecisionRequest) -> dict:
-    case = _load(case_id)
-    try:
-        result = _agent_for(case).reviewer_decision(
-            case,
-            approve=request.approve,
-            reason=request.reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _persist_result(case, result)
+def review(
+    case_id: str,
+    request: ReviewerDecisionRequest,
+    if_match: int | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    result = _mutate(
+        case_id,
+        lambda case: _agent_for(case).reviewer_decision(
+            case, approve=request.approve, reason=request.reason
+        ),
+        if_match,
+        idempotency_key,
+        _fingerprint("reviewer_decision", request.model_dump()),
+        request.reviewer,
+    )
+    result["review_task"] = "completed"
+    return result
+
+
+@app.get("/reviews/queue")
+def list_review_queue(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
+    return [task.to_dict() for task in review_queue.list_ready(limit=limit)]
+
+
+@app.post("/reviews/claim")
+def claim_review(request: ClaimReviewRequest) -> dict:
+    task = review_queue.claim_next(request.reviewer, lease_minutes=request.lease_minutes)
+    if task is None:
+        raise HTTPException(status_code=404, detail="review queue is empty")
+    return task.to_dict()
 
 
 @app.get("/cases/{case_id}/audit")
