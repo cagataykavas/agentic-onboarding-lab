@@ -180,3 +180,20 @@ CI also builds the wheel, installs it outside the repository, imports the instal
 the container and executes a container-level application import smoke test.
 
 All demo identities and evidence are synthetic. This project contains no real customer or employer information.
+
+
+## Tamper-evident audit checkpoints
+
+`audit_integrity.build_checkpoint` canonicalizes each audit event and commits it to a
+SHA-256 chain that includes all preceding history. Store the returned terminal digest
+and event count outside the case database—for example in immutable object storage or a
+separate compliance ledger—and later call `verify_checkpoint` against that trusted value.
+
+The verifier detects event mutation, deletion, insertion, and reordering, returns
+machine-readable failure reasons, rejects non-canonical values such as NaN, and versions
+the checkpoint schema. Dictionary key order does not affect the result.
+
+A hash checkpoint is an integrity signal, not identity or authorization. If an attacker
+can alter both the case database and the external checkpoint, verification cannot detect
+the rewrite. Production deployments should protect checkpoints with an independently
+controlled write-once store, signature service, or KMS-backed MAC.
