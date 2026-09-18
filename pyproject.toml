@@ -13,7 +13,7 @@ dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.8"]
 dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6", "build>=1.2"]
 
 [tool.setuptools]
-py-modules = ["onboarding"]
+py-modules = ["onboarding", "audit_integrity"]
 packages = ["service"]
 
 [tool.ruff]
