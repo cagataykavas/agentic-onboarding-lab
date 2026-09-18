@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from hmac import compare_digest
 
-
 GENESIS_DIGEST = "0" * 64
 
 
