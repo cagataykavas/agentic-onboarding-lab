@@ -16,6 +16,7 @@ from onboarding import (
     OnboardingCase,
     Stage,
 )
+from service.lease_tokens import digest_lease_token, lease_token_matches
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS onboarding_cases (
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS review_tasks (
     due_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_until TEXT,
+    lease_token_hash TEXT,
     completed_at TEXT,
     updated_at TEXT NOT NULL
 );
@@ -66,6 +68,10 @@ class DuplicateCase(RuntimeError):
 
 class IdempotencyConflict(RuntimeError):
     """Raised when a command key is reused for another case."""
+
+
+class ReviewAuthorizationError(RuntimeError):
+    """Raised when a reviewer cannot prove possession of the active lease."""
 
 
 def case_to_dict(case: OnboardingCase) -> dict:
@@ -151,6 +157,11 @@ class OnboardingRepository:
                 connection.execute(
                     "ALTER TABLE command_receipts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"
                 )
+            review_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(review_tasks)")
+            }
+            if "lease_token_hash" not in review_columns:
+                connection.execute("ALTER TABLE review_tasks ADD COLUMN lease_token_hash TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10, isolation_level=None)
@@ -227,6 +238,7 @@ class OnboardingRepository:
         command_id: str | None = None,
         command_fingerprint: str | None = None,
         review_lease_owner: str | None = None,
+        review_lease_token: str | None = None,
     ) -> tuple[OnboardingCase, object]:
         """Load, mutate and compare-and-swap a case under one write transaction.
 
@@ -283,10 +295,10 @@ class OnboardingRepository:
             case = case_from_dict(json.loads(row["payload"]))
             case.version = stored_version
             lease_now = datetime.now(UTC).isoformat()
-            if review_lease_owner is not None:
+            if review_lease_owner is not None or review_lease_token is not None:
                 lease = connection.execute(
                     """
-                    SELECT status, lease_owner, lease_until FROM review_tasks
+                    SELECT status, lease_owner, lease_until, lease_token_hash FROM review_tasks
                     WHERE case_id = ?
                     """,
                     (case_id,),
@@ -296,9 +308,10 @@ class OnboardingRepository:
                     or lease["status"] != "leased"
                     or lease["lease_owner"] != review_lease_owner
                     or lease["lease_until"] <= lease_now
+                    or not lease_token_matches(lease["lease_token_hash"], review_lease_token)
                 ):
                     connection.rollback()
-                    raise ValueError("review task is not actively leased by this reviewer")
+                    raise ReviewAuthorizationError("review lease credential is invalid or expired")
             result = operation(case)
             case.version = stored_version + 1
             payload = json.dumps(case_to_dict(case), sort_keys=True, separators=(",", ":"))
@@ -355,12 +368,15 @@ class OnboardingRepository:
                     ),
                 )
             if review_lease_owner is not None:
+                assert review_lease_token is not None
+                lease_token_hash = digest_lease_token(review_lease_token)
                 cursor = connection.execute(
                     """
                     UPDATE review_tasks
-                    SET status = 'completed', completed_at = ?, updated_at = ?
+                    SET status = 'completed', completed_at = ?, lease_token_hash = NULL,
+                        updated_at = ?
                     WHERE case_id = ? AND status = 'leased' AND lease_owner = ?
-                      AND lease_until > ?
+                      AND lease_until > ? AND lease_token_hash = ?
                     """,
                     (
                         lease_now,
@@ -368,11 +384,14 @@ class OnboardingRepository:
                         case.case_id,
                         review_lease_owner,
                         lease_now,
+                        lease_token_hash,
                     ),
                 )
                 if cursor.rowcount != 1:
                     connection.rollback()
-                    raise ValueError("review lease expired before the decision committed")
+                    raise ReviewAuthorizationError(
+                        "review lease credential changed before the decision committed"
+                    )
             connection.commit()
             return case, result
 

@@ -16,6 +16,7 @@ from service.reviews import ReviewQueue
 from service.store import (
     IdempotencyConflict,
     OnboardingRepository,
+    ReviewAuthorizationError,
     VersionConflict,
     case_to_dict,
 )
@@ -102,6 +103,7 @@ def _mutate(
     idempotency_key: str | None,
     command_fingerprint: str,
     review_lease_owner: str | None = None,
+    review_lease_token: str | None = None,
 ) -> dict:
     try:
         case, result = repository.mutate(
@@ -111,11 +113,14 @@ def _mutate(
             command_id=idempotency_key,
             command_fingerprint=command_fingerprint,
             review_lease_owner=review_lease_owner,
+            review_lease_token=review_lease_token,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="case not found") from exc
     except (VersionConflict, IdempotencyConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if isinstance(result, dict) and result.get("idempotent_replay"):
@@ -268,6 +273,7 @@ def review(
     request: ReviewerDecisionRequest,
     if_match: int | None = Header(default=None, alias="If-Match"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    review_lease_token: str | None = Header(default=None, alias="X-Review-Lease-Token"),
 ) -> dict:
     result = _mutate(
         case_id,
@@ -276,8 +282,19 @@ def review(
         ),
         if_match,
         idempotency_key,
-        _fingerprint("reviewer_decision", request.model_dump()),
+        _fingerprint(
+            "reviewer_decision",
+            {
+                **request.model_dump(),
+                "lease_token_hash": (
+                    hashlib.sha256(review_lease_token.encode()).hexdigest()
+                    if review_lease_token
+                    else None
+                ),
+            },
+        ),
         request.reviewer,
+        review_lease_token,
     )
     result["review_task"] = "completed"
     return result
@@ -293,7 +310,7 @@ def claim_review(request: ClaimReviewRequest) -> dict:
     task = review_queue.claim_next(request.reviewer, lease_minutes=request.lease_minutes)
     if task is None:
         raise HTTPException(status_code=404, detail="review queue is empty")
-    return task.to_dict()
+    return task.to_dict(include_token=True)
 
 
 @app.get("/cases/{case_id}/audit")

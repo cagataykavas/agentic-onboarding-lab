@@ -93,6 +93,18 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
     )
     assert claimed.status_code == 200
     assert claimed.json()["lease_owner"] == "analyst-1"
+    lease_token = claimed.json()["lease_token"]
+    assert len(lease_token) >= 32
+
+    missing_capability = client.post(
+        f"/cases/{case_id}/review",
+        json={
+            "approve": True,
+            "reason": "A reviewer name alone must not authorize the decision.",
+            "reviewer": "analyst-1",
+        },
+    )
+    assert missing_capability.status_code == 403
 
     unauthorized = client.post(
         f"/cases/{case_id}/review",
@@ -101,9 +113,21 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
             "reason": "A different analyst must not decide leased work.",
             "reviewer": "analyst-2",
         },
+        headers={"X-Review-Lease-Token": lease_token},
     )
-    assert unauthorized.status_code == 409
+    assert unauthorized.status_code == 403
     assert client.get(f"/cases/{case_id}").json()["stage"] == "human_review"
+
+    forged = client.post(
+        f"/cases/{case_id}/review",
+        json={
+            "approve": True,
+            "reason": "A matching name without the capability must not be sufficient.",
+            "reviewer": "analyst-1",
+        },
+        headers={"X-Review-Lease-Token": "forged-token"},
+    )
+    assert forged.status_code == 403
 
     reviewed = client.post(
         f"/cases/{case_id}/review",
@@ -112,6 +136,7 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
             "reason": "Synthetic conflict was manually resolved.",
             "reviewer": "analyst-1",
         },
+        headers={"X-Review-Lease-Token": lease_token},
     )
     assert reviewed.status_code == 200
     assert reviewed.json()["case"]["stage"] == "completed"
