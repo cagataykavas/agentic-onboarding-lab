@@ -98,6 +98,8 @@ This implementation treats a state transition as a command, not a CRUD overwrite
 - `Idempotency-Key` receipts make timeout retries safe without duplicate evidence or audit events;
 - escalation creates a durable review task in the same case transaction;
 - reviewers claim work through expiring leases, so abandoned tasks re-enter the queue;
+- each claim issues a high-entropy capability bound to the case, reviewer and active lease;
+- only the capability's SHA-256 digest is stored, and queue/audit responses never expose it;
 - queue order is deterministic: priority descending, then SLA deadline, then arrival time;
 - outcome is stored separately from the terminal `completed` stage.
 
@@ -141,10 +143,23 @@ curl -s -X POST localhost:8000/cases/ONB-.../consent \
 curl -s -X POST localhost:8000/reviews/claim \
   -H 'content-type: application/json' \
   -d '{"reviewer":"analyst-17","lease_minutes":15}'
+
+# use the returned lease_token only for the matching reviewer decision
+curl -s -X POST localhost:8000/cases/ONB-.../review \
+  -H 'content-type: application/json' \
+  -H 'X-Review-Lease-Token: <token returned exactly once by claim>' \
+  -d '{"reviewer":"analyst-17","approve":true,"reason":"Evidence independently verified."}'
 ```
 
 A repeated idempotency key returns `idempotent_replay: true`. A stale version, reused key from
-another case, illegal state transition or invalid reviewer lease returns HTTP 409.
+another case or illegal state transition returns HTTP 409. A missing, forged, expired or rotated
+review capability returns HTTP 403.
+
+The lease token is a bearer capability, not user authentication. Production deployments should
+still authenticate reviewers, authorize queue access, redact request headers in telemetry and use
+TLS. A database attacker who can replace both the lease digest and case state remains outside this
+reference implementation's trust boundary. Reclaiming an expired task rotates the capability, so
+an earlier reviewer cannot commit with a stale token.
 
 ## Repository layout
 
@@ -155,6 +170,7 @@ agentic-onboarding-lab/
 │   ├── api.py             # HTTP command and reviewer-queue boundary
 │   ├── store.py           # transactional versioning and command receipts
 │   ├── reviews.py         # priority/SLA queue and expiring leases
+│   ├── lease_tokens.py    # capability issuance, hashing and constant-time checks
 │   └── metrics.py         # audit-derived operational metrics
 ├── tests/
 │   ├── test_api.py        # end-to-end customer and reviewer journeys
