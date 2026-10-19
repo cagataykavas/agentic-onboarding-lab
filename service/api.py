@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from onboarding import OnboardingAgent, OnboardingCase, Stage
 from service.metrics import MetricsCalculator
@@ -19,6 +19,7 @@ from service.store import (
     VersionConflict,
     case_to_dict,
 )
+from service.tool_admission import ToolProposal, default_tool_policy
 
 
 class CreateCaseRequest(BaseModel):
@@ -63,12 +64,22 @@ class ClaimReviewRequest(BaseModel):
     lease_minutes: int = Field(default=15, ge=1, le=120)
 
 
+class ToolAdmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    tool_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    expected_case_version: int = Field(ge=1)
+    arguments: dict[str, object] = Field(default_factory=dict)
+
+
 DATABASE_PATH = Path(os.getenv("ONBOARDING_DATABASE_PATH", "onboarding.db"))
 repository = OnboardingRepository(DATABASE_PATH)
 review_queue = ReviewQueue(repository)
+tool_policy = default_tool_policy()
 app = FastAPI(
     title="Agentic Onboarding Platform",
-    version="0.3.0",
+    version="0.4.0",
     description="Policy-bounded onboarding workflow with explicit human escalation and audit trails.",
 )
 
@@ -165,6 +176,19 @@ def list_cases(
 @app.get("/cases/{case_id}")
 def get_case(case_id: str) -> dict:
     return case_to_dict(_load(case_id))
+
+
+@app.post("/cases/{case_id}/tool-calls/admit")
+def admit_tool_call(case_id: str, request: ToolAdmissionRequest) -> dict:
+    try:
+        proposal = ToolProposal(**request.model_dump())
+        return repository.admit_tool_call(case_id, proposal, tool_policy).to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="case not found") from exc
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/cases/{case_id}/consent")

@@ -16,6 +16,7 @@ from onboarding import (
     OnboardingCase,
     Stage,
 )
+from service.tool_admission import ToolAdmission, ToolAdmissionPolicy, ToolProposal, replay
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS onboarding_cases (
@@ -53,6 +54,18 @@ CREATE TABLE IF NOT EXISTS command_receipts (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_command_case ON command_receipts(case_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tool_admissions (
+    call_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES onboarding_cases(case_id),
+    tool_name TEXT NOT NULL,
+    proposal_hash TEXT NOT NULL,
+    allowed INTEGER NOT NULL CHECK(allowed IN (0, 1)),
+    decision TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_tool_admission_budget
+    ON tool_admissions(case_id, tool_name, allowed);
 """
 
 
@@ -375,6 +388,72 @@ class OnboardingRepository:
                     raise ValueError("review lease expired before the decision committed")
             connection.commit()
             return case, result
+
+    def admit_tool_call(
+        self,
+        case_id: str,
+        proposal: ToolProposal,
+        policy: ToolAdmissionPolicy,
+    ) -> ToolAdmission:
+        """Atomically bind a call ID to one policy decision and case snapshot."""
+
+        proposal_hash = proposal.sha256
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT case_id, proposal_hash, decision FROM tool_admissions WHERE call_id = ?",
+                (proposal.call_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["case_id"] != case_id or existing["proposal_hash"] != proposal_hash:
+                    connection.rollback()
+                    raise IdempotencyConflict(
+                        "tool call ID was reused for a different case or proposal"
+                    )
+                admission = ToolAdmission.from_dict(json.loads(existing["decision"]))
+                connection.commit()
+                return replay(admission)
+
+            row = connection.execute(
+                "SELECT payload, version FROM onboarding_cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(case_id)
+            case = case_from_dict(json.loads(row["payload"]))
+            case.version = int(row["version"])
+            prior_admissions = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM tool_admissions
+                    WHERE case_id = ? AND tool_name = ? AND allowed = 1
+                    """,
+                    (case_id, proposal.tool_name),
+                ).fetchone()[0]
+            )
+            admission = policy.evaluate(
+                case,
+                proposal,
+                prior_admissions=prior_admissions,
+            )
+            connection.execute(
+                """
+                INSERT INTO tool_admissions(
+                    call_id, case_id, tool_name, proposal_hash, allowed, decision
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal.call_id,
+                    case_id,
+                    proposal.tool_name,
+                    proposal_hash,
+                    int(admission.allowed),
+                    json.dumps(admission.to_dict(), sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            connection.commit()
+            return admission
 
     def upsert(self, case: OnboardingCase) -> None:
         """Compatibility API; create new cases and CAS-update loaded cases."""

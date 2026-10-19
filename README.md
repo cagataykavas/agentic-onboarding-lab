@@ -101,6 +101,37 @@ This implementation treats a state transition as a command, not a CRUD overwrite
 - queue order is deterministic: priority descending, then SLA deadline, then arrival time;
 - outcome is stored separately from the terminal `completed` stage.
 
+## Agent tool-call admission
+
+An LLM planner is not trusted to choose an arbitrary capability or construct an unrestricted
+argument object. `POST /cases/{case_id}/tool-calls/admit` evaluates each proposal against a
+server-owned catalog before an executor can receive it:
+
+- the case version and current workflow stage must match the proposal;
+- consent must still be active and completed cases cannot call tools;
+- tool names, revisions, allowed stages, argument names and per-case call budgets come from the
+  service, never from model output;
+- arguments are strict, bounded non-empty strings with no unknown keys;
+- a durable unique `call_id` binds retries to the original proposal and decision;
+- concurrent retries create one receipt and return the same deterministic decision;
+- reports expose stable reason codes and SHA-256 identities, not case IDs or argument values.
+
+```bash
+curl -s -X POST localhost:8000/cases/ONB-.../tool-calls/admit \
+  -H 'content-type: application/json' \
+  -d '{
+    "call_id":"identity-check-1",
+    "tool_name":"identity_document_check",
+    "expected_case_version":2,
+    "arguments":{"evidence_id":"identity-upload-1"}
+  }'
+```
+
+Admission is deliberately separate from execution. A production executor must consume an allowed
+receipt by `call_id` exactly once, apply its own network timeout and response validation, and bind
+the result to the admitted proposal digest. SHA-256 identities support comparison; they do not
+authenticate the planner or hide low-entropy input guesses.
+
 These boundaries remain useful if SQLite is replaced by PostgreSQL: the compare-and-swap update,
 command receipt and lease acquisition map directly to conditional updates and row locking.
 
@@ -155,7 +186,8 @@ agentic-onboarding-lab/
 │   ├── api.py             # HTTP command and reviewer-queue boundary
 │   ├── store.py           # transactional versioning and command receipts
 │   ├── reviews.py         # priority/SLA queue and expiring leases
-│   └── metrics.py         # audit-derived operational metrics
+│   ├── metrics.py         # audit-derived operational metrics
+│   └── tool_admission.py  # capability allow-list and deterministic admission evidence
 ├── tests/
 │   ├── test_api.py        # end-to-end customer and reviewer journeys
 │   ├── test_concurrency.py# stale-writer and thread-race regressions
