@@ -22,6 +22,7 @@ class ToolSpec:
     required_arguments: tuple[str, ...] = ()
     optional_arguments: tuple[str, ...] = ()
     max_admissions_per_case: int = 1
+    result_statuses: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         arguments = self.required_arguments + self.optional_arguments
@@ -35,6 +36,10 @@ class ToolSpec:
             raise ValueError("tool arguments must be stable identifiers")
         if not 1 <= self.max_admissions_per_case <= 100:
             raise ValueError("max_admissions_per_case must be in [1, 100]")
+        if not self.result_statuses or len(self.result_statuses) != len(set(self.result_statuses)):
+            raise ValueError("tool result statuses must be non-empty and unique")
+        if any(not _IDENTIFIER.fullmatch(status) for status in self.result_statuses):
+            raise ValueError("tool result statuses must be stable identifiers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +130,7 @@ class ToolAdmissionPolicy:
                     "required_arguments": list(spec.required_arguments),
                     "optional_arguments": list(spec.optional_arguments),
                     "max_admissions_per_case": spec.max_admissions_per_case,
+                    "result_statuses": list(spec.result_statuses),
                 }
             )
         return _json_digest(
@@ -199,6 +205,25 @@ class ToolAdmissionPolicy:
             decision_sha256=_json_digest(identity),
         )
 
+    def validate_result(self, tool_name: str, payload: dict[str, Any]) -> str:
+        """Validate a provider response without retaining its values."""
+
+        spec = self._specs.get(tool_name)
+        if spec is None:
+            raise ValueError("tool result references an unknown capability")
+        if not isinstance(payload, dict) or set(payload) != {"status", "provider_reference"}:
+            raise ValueError("tool result must contain exactly status and provider_reference")
+        status = payload["status"]
+        reference = payload["provider_reference"]
+        if not isinstance(status, str) or status not in spec.result_statuses:
+            raise ValueError("tool result status is not allowed for this capability")
+        if not isinstance(reference, str) or not _IDENTIFIER.fullmatch(reference):
+            raise ValueError("provider_reference must be a bounded stable identifier")
+        encoded = _canonical_json(payload)
+        if len(encoded) > 2048:
+            raise ValueError("tool result exceeds the response budget")
+        return _sha256(encoded)
+
 
 def default_tool_policy() -> ToolAdmissionPolicy:
     return ToolAdmissionPolicy(
@@ -210,6 +235,7 @@ def default_tool_policy() -> ToolAdmissionPolicy:
                 required_arguments=("evidence_id",),
                 optional_arguments=("document_country",),
                 max_admissions_per_case=3,
+                result_statuses=("verified", "rejected", "review"),
             ),
             ToolSpec(
                 name="address_registry_lookup",
@@ -218,6 +244,7 @@ def default_tool_policy() -> ToolAdmissionPolicy:
                 required_arguments=("address_evidence_id",),
                 optional_arguments=("country",),
                 max_admissions_per_case=2,
+                result_statuses=("matched", "not_found", "review"),
             ),
             ToolSpec(
                 name="risk_screening",
@@ -225,6 +252,7 @@ def default_tool_policy() -> ToolAdmissionPolicy:
                 allowed_stages=frozenset({Stage.RISK_SCREENING}),
                 required_arguments=("profile_snapshot_id",),
                 max_admissions_per_case=1,
+                result_statuses=("clear", "review", "block"),
             ),
         )
     )

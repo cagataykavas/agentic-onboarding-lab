@@ -6,6 +6,7 @@ import os
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -14,6 +15,7 @@ from onboarding import OnboardingAgent, OnboardingCase, Stage
 from service.metrics import MetricsCalculator
 from service.reviews import ReviewQueue
 from service.store import (
+    ExecutionConflict,
     IdempotencyConflict,
     OnboardingRepository,
     VersionConflict,
@@ -73,13 +75,35 @@ class ToolAdmissionRequest(BaseModel):
     arguments: dict[str, object] = Field(default_factory=dict)
 
 
+class ToolExecutionClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    admission_decision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    worker_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    lease_seconds: int = Field(default=60, ge=1, le=900)
+
+
+class ToolExecutionCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    admission_decision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    worker_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    attempt: int = Field(ge=1)
+    outcome: Literal["succeeded", "failed"]
+    result: dict[str, object] | None = None
+    failure_code: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+    )
+
+
 DATABASE_PATH = Path(os.getenv("ONBOARDING_DATABASE_PATH", "onboarding.db"))
 repository = OnboardingRepository(DATABASE_PATH)
 review_queue = ReviewQueue(repository)
 tool_policy = default_tool_policy()
 app = FastAPI(
     title="Agentic Onboarding Platform",
-    version="0.4.0",
+    version="0.5.0",
     description="Policy-bounded onboarding workflow with explicit human escalation and audit trails.",
 )
 
@@ -186,6 +210,55 @@ def admit_tool_call(case_id: str, request: ToolAdmissionRequest) -> dict:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="case not found") from exc
     except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/cases/{case_id}/tool-calls/{call_id}/claim")
+def claim_tool_execution(
+    case_id: str,
+    call_id: str,
+    request: ToolExecutionClaimRequest,
+) -> dict:
+    try:
+        return repository.claim_tool_execution(
+            case_id,
+            call_id,
+            admission_decision_sha256=request.admission_decision_sha256,
+            worker_id=request.worker_id,
+            policy=tool_policy,
+            lease_seconds=request.lease_seconds,
+        ).to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="tool call not found") from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/cases/{case_id}/tool-calls/{call_id}/complete")
+def complete_tool_execution(
+    case_id: str,
+    call_id: str,
+    request: ToolExecutionCompletionRequest,
+) -> dict:
+    try:
+        return repository.complete_tool_execution(
+            case_id,
+            call_id,
+            admission_decision_sha256=request.admission_decision_sha256,
+            worker_id=request.worker_id,
+            attempt=request.attempt,
+            outcome=request.outcome,
+            policy=tool_policy,
+            result=request.result,
+            failure_code=request.failure_code,
+        ).to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="tool call not found") from exc
+    except ExecutionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

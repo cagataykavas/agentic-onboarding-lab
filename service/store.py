@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from onboarding import (
@@ -17,6 +17,13 @@ from onboarding import (
     Stage,
 )
 from service.tool_admission import ToolAdmission, ToolAdmissionPolicy, ToolProposal, replay
+from service.tool_execution import (
+    ToolExecutionReceipt,
+    build_execution_receipt,
+    canonical_digest,
+    hash_identifier,
+    replay_execution,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS onboarding_cases (
@@ -62,6 +69,13 @@ CREATE TABLE IF NOT EXISTS tool_admissions (
     proposal_hash TEXT NOT NULL,
     allowed INTEGER NOT NULL CHECK(allowed IN (0, 1)),
     decision TEXT NOT NULL,
+    execution_state TEXT NOT NULL DEFAULT 'admitted',
+    execution_attempt INTEGER NOT NULL DEFAULT 0,
+    lease_owner_hash TEXT,
+    lease_expires_at TEXT,
+    result_hash TEXT,
+    failure_code TEXT,
+    execution_receipt TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_tool_admission_budget
@@ -81,15 +95,17 @@ class IdempotencyConflict(RuntimeError):
     """Raised when a command key is reused for another case."""
 
 
+class ExecutionConflict(RuntimeError):
+    """Raised when a tool execution lease or terminal receipt conflicts."""
+
+
 def case_to_dict(case: OnboardingCase) -> dict:
     payload = asdict(case)
     payload["stage"] = case.stage.value
     payload["risk_flags"] = sorted(case.risk_flags)
     for evidence in payload["evidence"]:
         evidence["status"] = (
-            evidence["status"].value
-            if hasattr(evidence["status"], "value")
-            else evidence["status"]
+            evidence["status"].value if hasattr(evidence["status"], "value") else evidence["status"]
         )
     for event in payload["audit"]:
         for key in ("actor", "stage_before", "stage_after"):
@@ -164,6 +180,23 @@ class OnboardingRepository:
                 connection.execute(
                     "ALTER TABLE command_receipts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"
                 )
+            admission_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(tool_admissions)")
+            }
+            migrations = {
+                "execution_state": "TEXT NOT NULL DEFAULT 'admitted'",
+                "execution_attempt": "INTEGER NOT NULL DEFAULT 0",
+                "lease_owner_hash": "TEXT",
+                "lease_expires_at": "TEXT",
+                "result_hash": "TEXT",
+                "failure_code": "TEXT",
+                "execution_receipt": "TEXT",
+            }
+            for column, definition in migrations.items():
+                if column not in admission_columns:
+                    connection.execute(
+                        f"ALTER TABLE tool_admissions ADD COLUMN {column} {definition}"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10, isolation_level=None)
@@ -455,6 +488,226 @@ class OnboardingRepository:
             connection.commit()
             return admission
 
+    def claim_tool_execution(
+        self,
+        case_id: str,
+        call_id: str,
+        *,
+        admission_decision_sha256: str,
+        worker_id: str,
+        policy: ToolAdmissionPolicy,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> ToolExecutionReceipt:
+        """Claim one admitted call with an expiring, monotonically fenced lease."""
+
+        if not 1 <= lease_seconds <= 900:
+            raise ValueError("lease_seconds must be in [1, 900]")
+        worker_sha256 = hash_identifier(worker_id, field="worker_id")
+        current = _utc_now(now)
+        lease_expires_at = (current + timedelta(seconds=lease_seconds)).isoformat()
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT case_id, proposal_hash, allowed, decision, execution_state,
+                       execution_attempt, lease_owner_hash, lease_expires_at,
+                       execution_receipt
+                FROM tool_admissions WHERE call_id = ?
+                """,
+                (call_id,),
+            ).fetchone()
+            if row is None or row["case_id"] != case_id:
+                connection.rollback()
+                raise KeyError(call_id)
+
+            admission = ToolAdmission.from_dict(json.loads(row["decision"]))
+            if admission.decision_sha256 != admission_decision_sha256:
+                connection.rollback()
+                raise ExecutionConflict("admission decision identity does not match")
+            if row["proposal_hash"] != admission.proposal_sha256:
+                connection.rollback()
+                raise ExecutionConflict("admission proposal identity does not match")
+            if not row["allowed"] or not admission.allowed:
+                connection.rollback()
+                raise ExecutionConflict("rejected tool call cannot be executed")
+
+            state = row["execution_state"]
+            if state not in {"admitted", "running", "succeeded", "failed"}:
+                connection.rollback()
+                raise ExecutionConflict("execution state is invalid")
+            if state in {"succeeded", "failed"}:
+                receipt = _load_execution_receipt(row["execution_receipt"])
+                connection.commit()
+                return replay_execution(receipt)
+
+            if admission.policy_sha256 != policy.sha256:
+                connection.rollback()
+                raise ExecutionConflict("tool policy changed after admission")
+            case = _load_execution_case(connection, case_id)
+            if not _case_matches_admission(case, admission):
+                connection.rollback()
+                raise ExecutionConflict("case state changed after tool-call admission")
+            if state == "running" and row["lease_expires_at"] > current.isoformat():
+                if row["lease_owner_hash"] != worker_sha256:
+                    connection.rollback()
+                    raise ExecutionConflict("tool call is actively leased by another worker")
+                receipt = _load_execution_receipt(row["execution_receipt"])
+                connection.commit()
+                return replay_execution(receipt)
+
+            attempt = int(row["execution_attempt"]) + 1
+            receipt = build_execution_receipt(
+                call_id=call_id,
+                state="running",
+                attempt=attempt,
+                proposal_sha256=row["proposal_hash"],
+                admission_decision_sha256=admission.decision_sha256,
+                worker_sha256=worker_sha256,
+                lease_expires_at=lease_expires_at,
+                should_execute=True,
+            )
+            connection.execute(
+                """
+                UPDATE tool_admissions
+                SET execution_state = 'running', execution_attempt = ?,
+                    lease_owner_hash = ?, lease_expires_at = ?, execution_receipt = ?
+                WHERE call_id = ?
+                """,
+                (
+                    attempt,
+                    worker_sha256,
+                    lease_expires_at,
+                    _serialize_execution_receipt(receipt),
+                    call_id,
+                ),
+            )
+            connection.commit()
+            return receipt
+
+    def complete_tool_execution(
+        self,
+        case_id: str,
+        call_id: str,
+        *,
+        admission_decision_sha256: str,
+        worker_id: str,
+        attempt: int,
+        outcome: str,
+        policy: ToolAdmissionPolicy,
+        result: dict | None = None,
+        failure_code: str | None = None,
+        now: datetime | None = None,
+    ) -> ToolExecutionReceipt:
+        """Commit one terminal result only while the matching execution fence is live."""
+
+        worker_sha256 = hash_identifier(worker_id, field="worker_id")
+        current = _utc_now(now)
+        if outcome not in {"succeeded", "failed"}:
+            raise ValueError("outcome must be succeeded or failed")
+        if outcome == "succeeded":
+            if result is None or failure_code is not None:
+                raise ValueError("successful completion requires only a result")
+        else:
+            if result is not None or failure_code not in {
+                "cancelled",
+                "invalid_response",
+                "provider_rejected",
+                "timeout",
+                "transport_error",
+            }:
+                raise ValueError("failed completion requires one allowed failure_code")
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT case_id, tool_name, proposal_hash, decision, execution_state,
+                       execution_attempt, lease_owner_hash, lease_expires_at,
+                       result_hash, failure_code, execution_receipt
+                FROM tool_admissions WHERE call_id = ?
+                """,
+                (call_id,),
+            ).fetchone()
+            if row is None or row["case_id"] != case_id:
+                connection.rollback()
+                raise KeyError(call_id)
+
+            admission = ToolAdmission.from_dict(json.loads(row["decision"]))
+            if admission.decision_sha256 != admission_decision_sha256:
+                connection.rollback()
+                raise ExecutionConflict("admission decision identity does not match")
+            requested_result_hash = canonical_digest(result) if result else None
+
+            if row["execution_state"] in {"succeeded", "failed"}:
+                if int(row["execution_attempt"]) != attempt:
+                    connection.rollback()
+                    raise ExecutionConflict("execution fence is stale")
+                if row["lease_owner_hash"] != worker_sha256:
+                    connection.rollback()
+                    raise ExecutionConflict("execution lease belongs to another worker")
+                if (
+                    row["execution_state"] != outcome
+                    or row["result_hash"] != requested_result_hash
+                    or row["failure_code"] != failure_code
+                ):
+                    connection.rollback()
+                    raise ExecutionConflict("tool call already has a different terminal result")
+                receipt = _load_execution_receipt(row["execution_receipt"])
+                connection.commit()
+                return replay_execution(receipt)
+            if row["execution_state"] != "running":
+                connection.rollback()
+                raise ExecutionConflict("tool call has not been claimed")
+            if int(row["execution_attempt"]) != attempt:
+                connection.rollback()
+                raise ExecutionConflict("execution fence is stale")
+            if row["lease_owner_hash"] != worker_sha256:
+                connection.rollback()
+                raise ExecutionConflict("execution lease belongs to another worker")
+            if row["lease_expires_at"] <= current.isoformat():
+                connection.rollback()
+                raise ExecutionConflict("execution lease expired before completion")
+            if admission.policy_sha256 != policy.sha256:
+                connection.rollback()
+                raise ExecutionConflict("tool policy changed after admission")
+            case = _load_execution_case(connection, case_id)
+            if not _case_matches_admission(case, admission):
+                connection.rollback()
+                raise ExecutionConflict("case state changed during tool execution")
+
+            result_hash = policy.validate_result(row["tool_name"], result) if result else None
+
+            receipt = build_execution_receipt(
+                call_id=call_id,
+                state=outcome,
+                attempt=attempt,
+                proposal_sha256=row["proposal_hash"],
+                admission_decision_sha256=admission.decision_sha256,
+                worker_sha256=worker_sha256,
+                lease_expires_at=row["lease_expires_at"],
+                result_sha256=result_hash,
+                failure_code=failure_code,
+            )
+            connection.execute(
+                """
+                UPDATE tool_admissions
+                SET execution_state = ?, result_hash = ?, failure_code = ?,
+                    execution_receipt = ?
+                WHERE call_id = ?
+                """,
+                (
+                    outcome,
+                    result_hash,
+                    failure_code,
+                    _serialize_execution_receipt(receipt),
+                    call_id,
+                ),
+            )
+            connection.commit()
+            return receipt
+
     def upsert(self, case: OnboardingCase) -> None:
         """Compatibility API; create new cases and CAS-update loaded cases."""
         existing = self.get(case.case_id)
@@ -486,3 +739,44 @@ class OnboardingRepository:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [case_from_dict(json.loads(row["payload"])) for row in rows]
+
+
+def _utc_now(value: datetime | None) -> datetime:
+    current = value or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("execution time must be timezone-aware")
+    return current.astimezone(UTC)
+
+
+def _load_execution_case(connection: sqlite3.Connection, case_id: str) -> OnboardingCase:
+    row = connection.execute(
+        "SELECT payload, version FROM onboarding_cases WHERE case_id = ?",
+        (case_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(case_id)
+    case = case_from_dict(json.loads(row["payload"]))
+    case.version = int(row["version"])
+    return case
+
+
+def _case_matches_admission(case: OnboardingCase, admission: ToolAdmission) -> bool:
+    return (
+        case.version == admission.case_version
+        and case.stage.value == admission.case_stage
+        and case.consent
+        and case.stage is not Stage.COMPLETED
+    )
+
+
+def _serialize_execution_receipt(receipt: ToolExecutionReceipt) -> str:
+    return json.dumps(receipt.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def _load_execution_receipt(payload: str | None) -> ToolExecutionReceipt:
+    if payload is None:
+        raise ExecutionConflict("execution receipt is missing")
+    try:
+        return ToolExecutionReceipt.from_dict(json.loads(payload))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExecutionConflict("execution receipt is malformed") from error

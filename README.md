@@ -101,7 +101,7 @@ This implementation treats a state transition as a command, not a CRUD overwrite
 - queue order is deterministic: priority descending, then SLA deadline, then arrival time;
 - outcome is stored separately from the terminal `completed` stage.
 
-## Agent tool-call admission
+## Agent tool-call admission and fenced execution
 
 An LLM planner is not trusted to choose an arbitrary capability or construct an unrestricted
 argument object. `POST /cases/{case_id}/tool-calls/admit` evaluates each proposal against a
@@ -127,10 +127,27 @@ curl -s -X POST localhost:8000/cases/ONB-.../tool-calls/admit \
   }'
 ```
 
-Admission is deliberately separate from execution. A production executor must consume an allowed
-receipt by `call_id` exactly once, apply its own network timeout and response validation, and bind
-the result to the admitted proposal digest. SHA-256 identities support comparison; they do not
-authenticate the planner or hide low-entropy input guesses.
+Before a side effect, a worker claims the admitted call through
+`POST /cases/{case_id}/tool-calls/{call_id}/claim`. The repository re-checks the admission decision,
+current policy digest, case version, stage and consent inside one SQLite write transaction. A claim
+has a 1–900 second lease and monotonically increasing attempt number that acts as a fencing token:
+
+- one concurrent worker receives `should_execute: true`; active competitors fail closed;
+- replaying the same active or terminal receipt never authorizes another execution;
+- an expired claim can be taken over only with a higher attempt number;
+- a stale worker, wrong owner or expired lease cannot publish a terminal result;
+- success responses must match the server-owned status schema for that exact tool;
+- only a response digest or allow-listed failure code is persisted, never provider values.
+
+Workers commit through `POST /cases/{case_id}/tool-calls/{call_id}/complete`. The terminal receipt
+binds the proposal, admission decision, hashed worker, fence and validated response identity.
+Identical completion retries replay the receipt; conflicting outcomes return HTTP 409.
+
+This state machine prevents two workers from concurrently committing one call. It cannot make an
+external provider side effect atomic with SQLite: if a lease holder performs a side effect and dies
+before completion, a takeover has an unknown outcome. Non-idempotent tools still require a
+provider-side idempotency key or reconciliation before retry. SHA-256 identities support
+comparison; they do not authenticate the planner, worker or evidence producer.
 
 These boundaries remain useful if SQLite is replaced by PostgreSQL: the compare-and-swap update,
 command receipt and lease acquisition map directly to conditional updates and row locking.
@@ -187,12 +204,14 @@ agentic-onboarding-lab/
 │   ├── store.py           # transactional versioning and command receipts
 │   ├── reviews.py         # priority/SLA queue and expiring leases
 │   ├── metrics.py         # audit-derived operational metrics
-│   └── tool_admission.py  # capability allow-list and deterministic admission evidence
+│   ├── tool_admission.py  # capability allow-list and response contracts
+│   └── tool_execution.py  # fenced, privacy-reduced execution receipts
 ├── tests/
 │   ├── test_api.py        # end-to-end customer and reviewer journeys
 │   ├── test_concurrency.py# stale-writer and thread-race regressions
 │   ├── test_reviews.py    # queue ordering, expiry and ownership
-│   └── test_metrics.py    # service KPI derivation
+│   ├── test_metrics.py    # service KPI derivation
+│   └── test_tool_execution.py # claim, takeover, fencing and terminal-result contracts
 ├── onboarding_ui.html     # static customer journey prototype
 ├── Dockerfile             # non-interactive production service image
 └── .github/workflows/ci.yml
