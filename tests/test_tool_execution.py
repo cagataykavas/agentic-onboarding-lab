@@ -150,16 +150,41 @@ def test_case_or_policy_drift_after_admission_fails_before_claim(tmp_path: Path)
         )
 
 
-def test_expired_lease_reclaim_increments_fence_and_rejects_old_worker(tmp_path: Path) -> None:
+def test_expired_lease_requires_reconciliation_before_fenced_retry(tmp_path: Path) -> None:
     repository = OnboardingRepository(tmp_path / "takeover.db")
     case_id, decision_sha256 = _admit(repository)
     first = _claim(repository, case_id, decision_sha256)
+
+    with pytest.raises(ExecutionConflict, match="requires outcome reconciliation"):
+        _claim(
+            repository,
+            case_id,
+            decision_sha256,
+            worker_id="worker-b",
+            now=NOW + timedelta(seconds=31),
+        )
+
+    reconciliation = repository.claim_tool_reconciliation(
+        reconciler_id="reconciler-a",
+        lease_seconds=30,
+        now=NOW + timedelta(seconds=31),
+    )
+    assert reconciliation is not None
+    repository.resolve_tool_reconciliation(
+        "call-1",
+        execution_attempt=first.attempt,
+        reconciliation_attempt=reconciliation.reconciliation_attempt,
+        reconciler_id="reconciler-a",
+        decision="not_applied",
+        policy=default_tool_policy(),
+        now=NOW + timedelta(seconds=32),
+    )
     second = _claim(
         repository,
         case_id,
         decision_sha256,
         worker_id="worker-b",
-        now=NOW + timedelta(seconds=31),
+        now=NOW + timedelta(seconds=33),
     )
 
     assert first.attempt == 1
