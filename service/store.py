@@ -24,6 +24,11 @@ from service.tool_execution import (
     hash_identifier,
     replay_execution,
 )
+from service.tool_reconciliation import (
+    ToolReconciliationReceipt,
+    build_reconciliation_receipt,
+    replay_reconciliation,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS onboarding_cases (
@@ -80,6 +85,25 @@ CREATE TABLE IF NOT EXISTS tool_admissions (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_admission_budget
     ON tool_admissions(case_id, tool_name, allowed);
+
+CREATE TABLE IF NOT EXISTS tool_reconciliations (
+    call_id TEXT NOT NULL REFERENCES tool_admissions(call_id),
+    execution_attempt INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'leased', 'resolved')),
+    execution_receipt_hash TEXT NOT NULL,
+    reconciliation_attempt INTEGER NOT NULL DEFAULT 0,
+    lease_owner_hash TEXT,
+    lease_expires_at TEXT,
+    decision TEXT,
+    result_hash TEXT,
+    reconciliation_receipt TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(call_id, execution_attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_reconciliation_queue
+    ON tool_reconciliations(status, created_at, call_id, execution_attempt);
 """
 
 
@@ -545,11 +569,22 @@ class OnboardingRepository:
             if admission.policy_sha256 != policy.sha256:
                 connection.rollback()
                 raise ExecutionConflict("tool policy changed after admission")
+            if state == "running" and row["lease_expires_at"] <= current.isoformat():
+                receipt = _load_execution_receipt(row["execution_receipt"])
+                _enqueue_tool_reconciliation(
+                    connection,
+                    call_id=call_id,
+                    execution_attempt=int(row["execution_attempt"]),
+                    execution_receipt_sha256=receipt.receipt_sha256,
+                    created_at=current.isoformat(),
+                )
+                connection.commit()
+                raise ExecutionConflict("expired execution requires outcome reconciliation")
             case = _load_execution_case(connection, case_id)
             if not _case_matches_admission(case, admission):
                 connection.rollback()
                 raise ExecutionConflict("case state changed after tool-call admission")
-            if state == "running" and row["lease_expires_at"] > current.isoformat():
+            if state == "running":
                 if row["lease_owner_hash"] != worker_sha256:
                     connection.rollback()
                     raise ExecutionConflict("tool call is actively leased by another worker")
@@ -581,6 +616,225 @@ class OnboardingRepository:
                     lease_expires_at,
                     _serialize_execution_receipt(receipt),
                     call_id,
+                ),
+            )
+            connection.commit()
+            return receipt
+
+    def claim_tool_reconciliation(
+        self,
+        *,
+        reconciler_id: str,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> ToolReconciliationReceipt | None:
+        """Lease one queued/expired reconciliation task with a monotonic fence."""
+
+        if not 1 <= lease_seconds <= 900:
+            raise ValueError("lease_seconds must be in [1, 900]")
+        reconciler_sha256 = hash_identifier(reconciler_id, field="reconciler_id")
+        current = _utc_now(now)
+        lease_expires_at = (current + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT call_id, execution_attempt, status, execution_receipt_hash,
+                       reconciliation_attempt, lease_expires_at
+                FROM tool_reconciliations
+                WHERE status = 'queued'
+                   OR (status = 'leased' AND lease_expires_at <= ?)
+                ORDER BY created_at, call_id, execution_attempt
+                LIMIT 1
+                """,
+                (current.isoformat(),),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            reconciliation_attempt = int(row["reconciliation_attempt"]) + 1
+            receipt = build_reconciliation_receipt(
+                call_id=row["call_id"],
+                execution_attempt=int(row["execution_attempt"]),
+                state="leased",
+                reconciliation_attempt=reconciliation_attempt,
+                execution_receipt_sha256=row["execution_receipt_hash"],
+                reconciler_sha256=reconciler_sha256,
+                lease_expires_at=lease_expires_at,
+                should_reconcile=True,
+            )
+            connection.execute(
+                """
+                UPDATE tool_reconciliations
+                SET status = 'leased', reconciliation_attempt = ?, lease_owner_hash = ?,
+                    lease_expires_at = ?, reconciliation_receipt = ?, updated_at = ?
+                WHERE call_id = ? AND execution_attempt = ?
+                """,
+                (
+                    reconciliation_attempt,
+                    reconciler_sha256,
+                    lease_expires_at,
+                    _serialize_reconciliation_receipt(receipt),
+                    current.isoformat(),
+                    row["call_id"],
+                    int(row["execution_attempt"]),
+                ),
+            )
+            connection.commit()
+            return receipt
+
+    def resolve_tool_reconciliation(
+        self,
+        call_id: str,
+        *,
+        execution_attempt: int,
+        reconciliation_attempt: int,
+        reconciler_id: str,
+        decision: str,
+        policy: ToolAdmissionPolicy,
+        result: dict | None = None,
+        now: datetime | None = None,
+    ) -> ToolReconciliationReceipt:
+        """Resolve an unknown outcome as applied or safe to retry."""
+
+        if decision not in {"applied", "not_applied"}:
+            raise ValueError("reconciliation decision must be applied or not_applied")
+        if decision == "applied" and result is None:
+            raise ValueError("applied reconciliation requires a provider result")
+        if decision == "not_applied" and result is not None:
+            raise ValueError("not_applied reconciliation cannot include a result")
+        reconciler_sha256 = hash_identifier(reconciler_id, field="reconciler_id")
+        current = _utc_now(now)
+        requested_result_hash = canonical_digest(result) if result is not None else None
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT status, execution_receipt_hash, reconciliation_attempt,
+                       lease_owner_hash, lease_expires_at, decision, result_hash,
+                       reconciliation_receipt
+                FROM tool_reconciliations
+                WHERE call_id = ? AND execution_attempt = ?
+                """,
+                (call_id, execution_attempt),
+            ).fetchone()
+            if task is None:
+                connection.rollback()
+                raise KeyError(call_id)
+            if task["status"] == "resolved":
+                if (
+                    int(task["reconciliation_attempt"]) != reconciliation_attempt
+                    or task["lease_owner_hash"] != reconciler_sha256
+                    or task["decision"] != decision
+                    or task["result_hash"] != requested_result_hash
+                ):
+                    connection.rollback()
+                    raise ExecutionConflict("reconciliation already has a different resolution")
+                receipt = _load_reconciliation_receipt(task["reconciliation_receipt"])
+                connection.commit()
+                return replay_reconciliation(receipt)
+            if task["status"] != "leased":
+                connection.rollback()
+                raise ExecutionConflict("reconciliation task is not leased")
+            if int(task["reconciliation_attempt"]) != reconciliation_attempt:
+                connection.rollback()
+                raise ExecutionConflict("reconciliation fence is stale")
+            if task["lease_owner_hash"] != reconciler_sha256:
+                connection.rollback()
+                raise ExecutionConflict("reconciliation lease belongs to another worker")
+            if task["lease_expires_at"] <= current.isoformat():
+                connection.rollback()
+                raise ExecutionConflict("reconciliation lease expired before resolution")
+
+            execution = connection.execute(
+                """
+                SELECT tool_name, proposal_hash, decision, execution_state,
+                       execution_attempt, lease_owner_hash, lease_expires_at,
+                       execution_receipt
+                FROM tool_admissions WHERE call_id = ?
+                """,
+                (call_id,),
+            ).fetchone()
+            if (
+                execution is None
+                or execution["execution_state"] != "running"
+                or int(execution["execution_attempt"]) != execution_attempt
+            ):
+                connection.rollback()
+                raise ExecutionConflict("execution state changed before reconciliation")
+            running_receipt = _load_execution_receipt(execution["execution_receipt"])
+            if running_receipt.receipt_sha256 != task["execution_receipt_hash"]:
+                connection.rollback()
+                raise ExecutionConflict("reconciliation execution identity does not match")
+            admission = ToolAdmission.from_dict(json.loads(execution["decision"]))
+            if admission.policy_sha256 != policy.sha256:
+                connection.rollback()
+                raise ExecutionConflict("tool policy changed before reconciliation")
+
+            terminal_receipt_sha256: str | None = None
+            result_hash: str | None = None
+            if decision == "applied":
+                result_hash = policy.validate_result(execution["tool_name"], result)
+                terminal = build_execution_receipt(
+                    call_id=call_id,
+                    state="succeeded",
+                    attempt=execution_attempt,
+                    proposal_sha256=execution["proposal_hash"],
+                    admission_decision_sha256=admission.decision_sha256,
+                    worker_sha256=execution["lease_owner_hash"],
+                    lease_expires_at=execution["lease_expires_at"],
+                    result_sha256=result_hash,
+                )
+                terminal_receipt_sha256 = terminal.receipt_sha256
+                connection.execute(
+                    """
+                    UPDATE tool_admissions
+                    SET execution_state = 'succeeded', result_hash = ?, failure_code = NULL,
+                        execution_receipt = ?
+                    WHERE call_id = ?
+                    """,
+                    (result_hash, _serialize_execution_receipt(terminal), call_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE tool_admissions
+                    SET execution_state = 'admitted', lease_owner_hash = NULL,
+                        lease_expires_at = NULL, result_hash = NULL, failure_code = NULL,
+                        execution_receipt = NULL
+                    WHERE call_id = ?
+                    """,
+                    (call_id,),
+                )
+
+            receipt = build_reconciliation_receipt(
+                call_id=call_id,
+                execution_attempt=execution_attempt,
+                state="resolved",
+                reconciliation_attempt=reconciliation_attempt,
+                execution_receipt_sha256=task["execution_receipt_hash"],
+                reconciler_sha256=reconciler_sha256,
+                lease_expires_at=task["lease_expires_at"],
+                decision=decision,
+                result_sha256=result_hash,
+                terminal_execution_receipt_sha256=terminal_receipt_sha256,
+            )
+            connection.execute(
+                """
+                UPDATE tool_reconciliations
+                SET status = 'resolved', decision = ?, result_hash = ?,
+                    reconciliation_receipt = ?, resolved_at = ?, updated_at = ?
+                WHERE call_id = ? AND execution_attempt = ?
+                """,
+                (
+                    decision,
+                    result_hash,
+                    _serialize_reconciliation_receipt(receipt),
+                    current.isoformat(),
+                    current.isoformat(),
+                    call_id,
+                    execution_attempt,
                 ),
             )
             connection.commit()
@@ -780,3 +1034,51 @@ def _load_execution_receipt(payload: str | None) -> ToolExecutionReceipt:
         return ToolExecutionReceipt.from_dict(json.loads(payload))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ExecutionConflict("execution receipt is malformed") from error
+
+
+def _enqueue_tool_reconciliation(
+    connection: sqlite3.Connection,
+    *,
+    call_id: str,
+    execution_attempt: int,
+    execution_receipt_sha256: str,
+    created_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO tool_reconciliations (
+            call_id, execution_attempt, status, execution_receipt_hash,
+            created_at, updated_at
+        ) VALUES (?, ?, 'queued', ?, ?, ?)
+        """,
+        (
+            call_id,
+            execution_attempt,
+            execution_receipt_sha256,
+            created_at,
+            created_at,
+        ),
+    )
+    row = connection.execute(
+        """
+        SELECT execution_receipt_hash
+        FROM tool_reconciliations
+        WHERE call_id = ? AND execution_attempt = ?
+        """,
+        (call_id, execution_attempt),
+    ).fetchone()
+    if row is None or row["execution_receipt_hash"] != execution_receipt_sha256:
+        raise ExecutionConflict("reconciliation execution identity does not match")
+
+
+def _serialize_reconciliation_receipt(receipt: ToolReconciliationReceipt) -> str:
+    return json.dumps(receipt.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def _load_reconciliation_receipt(payload: str | None) -> ToolReconciliationReceipt:
+    if payload is None:
+        raise ExecutionConflict("reconciliation receipt is missing")
+    try:
+        return ToolReconciliationReceipt.from_dict(json.loads(payload))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExecutionConflict("reconciliation receipt is malformed") from error

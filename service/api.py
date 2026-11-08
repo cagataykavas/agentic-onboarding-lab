@@ -97,13 +97,30 @@ class ToolExecutionCompletionRequest(BaseModel):
     )
 
 
+class ToolReconciliationClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reconciler_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    lease_seconds: int = Field(default=300, ge=1, le=900)
+
+
+class ToolReconciliationResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    execution_attempt: int = Field(ge=1)
+    reconciliation_attempt: int = Field(ge=1)
+    reconciler_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    decision: Literal["applied", "not_applied"]
+    result: dict[str, object] | None = None
+
+
 DATABASE_PATH = Path(os.getenv("ONBOARDING_DATABASE_PATH", "onboarding.db"))
 repository = OnboardingRepository(DATABASE_PATH)
 review_queue = ReviewQueue(repository)
 tool_policy = default_tool_policy()
 app = FastAPI(
     title="Agentic Onboarding Platform",
-    version="0.5.0",
+    version="0.6.0",
     description="Policy-bounded onboarding workflow with explicit human escalation and audit trails.",
 )
 
@@ -258,6 +275,43 @@ def complete_tool_execution(
         ).to_dict()
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="tool call not found") from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/tool-reconciliations/claim")
+def claim_tool_reconciliation(request: ToolReconciliationClaimRequest) -> dict:
+    try:
+        receipt = repository.claim_tool_reconciliation(
+            reconciler_id=request.reconciler_id,
+            lease_seconds=request.lease_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="reconciliation queue is empty")
+    return receipt.to_dict()
+
+
+@app.post("/tool-reconciliations/{call_id}/resolve")
+def resolve_tool_reconciliation(
+    call_id: str,
+    request: ToolReconciliationResolutionRequest,
+) -> dict:
+    try:
+        return repository.resolve_tool_reconciliation(
+            call_id,
+            execution_attempt=request.execution_attempt,
+            reconciliation_attempt=request.reconciliation_attempt,
+            reconciler_id=request.reconciler_id,
+            decision=request.decision,
+            policy=tool_policy,
+            result=request.result,
+        ).to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="reconciliation task not found") from exc
     except ExecutionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:

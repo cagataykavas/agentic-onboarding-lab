@@ -134,7 +134,7 @@ has a 1–900 second lease and monotonically increasing attempt number that acts
 
 - one concurrent worker receives `should_execute: true`; active competitors fail closed;
 - replaying the same active or terminal receipt never authorizes another execution;
-- an expired claim can be taken over only with a higher attempt number;
+- an expired claim is quarantined for outcome reconciliation instead of authorizing a retry;
 - a stale worker, wrong owner or expired lease cannot publish a terminal result;
 - success responses must match the server-owned status schema for that exact tool;
 - only a response digest or allow-listed failure code is persisted, never provider values.
@@ -145,9 +145,24 @@ Identical completion retries replay the receipt; conflicting outcomes return HTT
 
 This state machine prevents two workers from concurrently committing one call. It cannot make an
 external provider side effect atomic with SQLite: if a lease holder performs a side effect and dies
-before completion, a takeover has an unknown outcome. Non-idempotent tools still require a
-provider-side idempotency key or reconciliation before retry. SHA-256 identities support
-comparison; they do not authenticate the planner, worker or evidence producer.
+before completion, the outcome is unknown. The first observer of an expired execution atomically
+creates one reconciliation task for that exact execution fence. A leased reconciler must query the
+provider using the original stable reference and record one of two decisions:
+
+- `applied` validates the provider result and finalizes the original execution attempt;
+- `not_applied` returns the call to `admitted`, allowing the next executor claim to receive a higher
+  fencing token.
+
+Until one of those decisions commits, no executor is reauthorized. Reconciliation leases are also
+fenced and reclaimable after expiry. Receipts bind the original execution receipt, hashed
+reconciler, lease, decision, result digest and terminal receipt; provider values and raw worker IDs
+are not stored. See [the reconciliation runbook](docs/tool_outcome_reconciliation.md) for the API
+contract, invariants and operational limits.
+
+Non-idempotent tools should still use a provider-side idempotency key. Reconciliation depends on a
+provider lookup that can reliably distinguish “applied” from “not applied”; an ambiguous lookup must
+remain leased or be escalated, never guessed. SHA-256 identities support comparison but do not
+authenticate the planner, executor, reconciler or evidence producer.
 
 These boundaries remain useful if SQLite is replaced by PostgreSQL: the compare-and-swap update,
 command receipt and lease acquisition map directly to conditional updates and row locking.
@@ -205,13 +220,17 @@ agentic-onboarding-lab/
 │   ├── reviews.py         # priority/SLA queue and expiring leases
 │   ├── metrics.py         # audit-derived operational metrics
 │   ├── tool_admission.py  # capability allow-list and response contracts
-│   └── tool_execution.py  # fenced, privacy-reduced execution receipts
+│   ├── tool_execution.py  # fenced, privacy-reduced execution receipts
+│   └── tool_reconciliation.py # unknown-outcome reconciliation receipts
+├── docs/
+│   └── tool_outcome_reconciliation.md # recovery contract and operator runbook
 ├── tests/
 │   ├── test_api.py        # end-to-end customer and reviewer journeys
 │   ├── test_concurrency.py# stale-writer and thread-race regressions
 │   ├── test_reviews.py    # queue ordering, expiry and ownership
 │   ├── test_metrics.py    # service KPI derivation
-│   └── test_tool_execution.py # claim, takeover, fencing and terminal-result contracts
+│   ├── test_tool_execution.py # claim, completion and fencing contracts
+│   └── test_tool_reconciliation.py # unknown-outcome recovery and privacy contracts
 ├── onboarding_ui.html     # static customer journey prototype
 ├── Dockerfile             # non-interactive production service image
 └── .github/workflows/ci.yml
