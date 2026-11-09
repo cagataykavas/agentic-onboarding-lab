@@ -57,6 +57,28 @@ class ToolReconciliationReceipt:
         return rebuilt
 
 
+@dataclass(frozen=True, slots=True)
+class ToolReconciliationMetrics:
+    """Low-cardinality snapshot derived from durable reconciliation state."""
+
+    schema_version: int
+    generated_at: str
+    queue_depth: int
+    queued_tasks: int
+    leased_tasks: int
+    expired_leases: int
+    reclaimed_tasks: int
+    resolved_tasks: int
+    applied_resolutions: int
+    not_applied_resolutions: int
+    oldest_unresolved_age_seconds: int | None
+    mean_resolution_latency_seconds: float | None
+    max_resolution_latency_seconds: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def build_reconciliation_receipt(
     *,
     call_id: str,

@@ -185,6 +185,12 @@ records. It reports completion and human-review rates, automated/reviewer decisi
 density, stage distribution, queued/leased work and SLA breaches. Metrics are recomputable rather
 than increment-only counters that drift after retries.
 
+`GET /metrics/tool-reconciliation` derives a separate low-cardinality snapshot directly from the
+durable unknown-outcome queue. It reports unresolved depth, queued and leased work, currently
+expired leases, reclaimed tasks, oldest unresolved age, enqueue-to-resolution latency, and fixed
+`applied`/`not_applied` decision counts. It never labels metrics with call, case, executor,
+reconciler, or provider identifiers.
+
 ## API workflow
 
 ```bash

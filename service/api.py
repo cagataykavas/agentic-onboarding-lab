@@ -195,6 +195,11 @@ def journey_metrics() -> dict[str, object]:
     return MetricsCalculator().calculate(cases, tasks).to_dict()
 
 
+@app.get("/metrics/tool-reconciliation")
+def tool_reconciliation_metrics() -> dict[str, object]:
+    return repository.tool_reconciliation_metrics().to_dict()
+
+
 @app.post("/cases", status_code=201)
 def create_case(request: CreateCaseRequest) -> dict:
     case = OnboardingCase(
