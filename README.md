@@ -189,7 +189,9 @@ than increment-only counters that drift after retries.
 durable unknown-outcome queue. It reports unresolved depth, queued and leased work, currently
 expired leases, reclaimed tasks, oldest unresolved age, enqueue-to-resolution latency, and fixed
 `applied`/`not_applied` decision counts. It never labels metrics with call, case, executor,
-reconciler, or provider identifiers.
+reconciler, or provider identifiers. `python -m service.reconciliation_alerts` validates snapshot
+invariants and freshness, then applies a strict reviewed threshold policy. See the
+[alert-gate runbook](docs/reconciliation_alerts.md).
 
 ## API workflow
 
@@ -227,9 +229,11 @@ agentic-onboarding-lab/
 │   ├── metrics.py         # audit-derived operational metrics
 │   ├── tool_admission.py  # capability allow-list and response contracts
 │   ├── tool_execution.py  # fenced, privacy-reduced execution receipts
-│   └── tool_reconciliation.py # unknown-outcome reconciliation receipts
+│   ├── tool_reconciliation.py # unknown-outcome reconciliation receipts
+│   └── reconciliation_alerts.py # reviewed reconciliation health threshold gate
 ├── docs/
-│   └── tool_outcome_reconciliation.md # recovery contract and operator runbook
+│   ├── tool_outcome_reconciliation.md # recovery contract and operator runbook
+│   └── reconciliation_alerts.md # health policy and alert decision contract
 ├── tests/
 │   ├── test_api.py        # end-to-end customer and reviewer journeys
 │   ├── test_concurrency.py# stale-writer and thread-race regressions
