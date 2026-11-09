@@ -25,6 +25,7 @@ from service.tool_execution import (
     replay_execution,
 )
 from service.tool_reconciliation import (
+    ToolReconciliationMetrics,
     ToolReconciliationReceipt,
     build_reconciliation_receipt,
     replay_reconciliation,
@@ -682,6 +683,111 @@ class OnboardingRepository:
             )
             connection.commit()
             return receipt
+
+    def tool_reconciliation_metrics(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> ToolReconciliationMetrics:
+        """Derive one bounded operational snapshot without per-task labels."""
+
+        current = _utc_now(now)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_tasks,
+                    SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued_tasks,
+                    SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END) AS leased_tasks,
+                    SUM(
+                        CASE WHEN status = 'leased' AND lease_expires_at <= ?
+                             THEN 1 ELSE 0 END
+                    ) AS expired_leases,
+                    SUM(CASE WHEN reconciliation_attempt > 1 THEN 1 ELSE 0 END)
+                        AS reclaimed_tasks,
+                    SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_tasks,
+                    SUM(
+                        CASE WHEN status = 'leased' AND lease_expires_at IS NULL
+                             THEN 1 ELSE 0 END
+                    ) AS invalid_leased_tasks,
+                    SUM(
+                        CASE WHEN status = 'resolved' AND (
+                            resolved_at IS NULL OR julianday(resolved_at) IS NULL
+                            OR julianday(created_at) IS NULL
+                        ) THEN 1 ELSE 0 END
+                    ) AS invalid_resolved_tasks,
+                    SUM(
+                        CASE WHEN status = 'resolved' AND decision = 'applied'
+                             THEN 1 ELSE 0 END
+                    ) AS applied_resolutions,
+                    SUM(
+                        CASE WHEN status = 'resolved' AND decision = 'not_applied'
+                             THEN 1 ELSE 0 END
+                    ) AS not_applied_resolutions,
+                    MIN(CASE WHEN status != 'resolved' THEN created_at END)
+                        AS oldest_unresolved_created_at,
+                    AVG(
+                        CASE WHEN status = 'resolved'
+                             THEN (julianday(resolved_at) - julianday(created_at)) * 86400.0
+                        END
+                    ) AS mean_resolution_latency_seconds,
+                    MAX(
+                        CASE WHEN status = 'resolved'
+                             THEN (julianday(resolved_at) - julianday(created_at)) * 86400.0
+                        END
+                    ) AS max_resolution_latency_seconds
+                FROM tool_reconciliations
+                """,
+                (current.isoformat(),),
+            ).fetchone()
+
+        assert row is not None
+        queued = int(row["queued_tasks"] or 0)
+        leased = int(row["leased_tasks"] or 0)
+        resolved = int(row["resolved_tasks"] or 0)
+        applied = int(row["applied_resolutions"] or 0)
+        not_applied = int(row["not_applied_resolutions"] or 0)
+        total = int(row["total_tasks"])
+        if (
+            total != queued + leased + resolved
+            or resolved != applied + not_applied
+            or int(row["invalid_leased_tasks"] or 0)
+            or int(row["invalid_resolved_tasks"] or 0)
+        ):
+            raise ValueError("reconciliation metrics source state is inconsistent")
+        oldest_created_at = row["oldest_unresolved_created_at"]
+        oldest_age: int | None = None
+        if oldest_created_at is not None:
+            created_at = datetime.fromisoformat(oldest_created_at)
+            if created_at.tzinfo is None or created_at.utcoffset() is None:
+                raise ValueError("reconciliation timestamps must be timezone-aware")
+            oldest_age = max(0, int((current - created_at.astimezone(UTC)).total_seconds()))
+
+        def optional_seconds(value: object) -> float | None:
+            return None if value is None else round(max(0.0, float(value)), 3)
+
+        mean_latency = optional_seconds(row["mean_resolution_latency_seconds"])
+        max_latency = optional_seconds(row["max_resolution_latency_seconds"])
+        if (resolved > 0) != (mean_latency is not None and max_latency is not None):
+            raise ValueError("reconciliation resolution latency is inconsistent")
+        if (queued + leased > 0) != (oldest_age is not None):
+            raise ValueError("reconciliation queue age is inconsistent")
+
+        return ToolReconciliationMetrics(
+            schema_version=1,
+            generated_at=current.isoformat(),
+            queue_depth=queued + leased,
+            queued_tasks=queued,
+            leased_tasks=leased,
+            expired_leases=int(row["expired_leases"] or 0),
+            reclaimed_tasks=int(row["reclaimed_tasks"] or 0),
+            resolved_tasks=resolved,
+            applied_resolutions=applied,
+            not_applied_resolutions=not_applied,
+            oldest_unresolved_age_seconds=oldest_age,
+            mean_resolution_latency_seconds=mean_latency,
+            max_resolution_latency_seconds=max_latency,
+        )
 
     def resolve_tool_reconciliation(
         self,

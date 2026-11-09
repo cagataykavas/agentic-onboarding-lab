@@ -58,6 +58,24 @@ execution fence. `BEGIN IMMEDIATE` serializes enqueue, lease and resolution upda
    result is validated and discarded; only its SHA-256 identity is stored. `not_applied` forbids a
    result payload and is the only decision that permits a later executor to obtain a higher fence.
 
+## Operational snapshot
+
+`GET /metrics/tool-reconciliation` recomputes one JSON snapshot from the durable queue on every
+request. The fixed schema exposes:
+
+- unresolved queue depth with queued and leased splits;
+- leases that are currently expired and tasks that have been reclaimed at least once;
+- whole-second age of the oldest unresolved task;
+- mean and maximum time from durable enqueue to resolution; and
+- total resolved, `applied`, and `not_applied` decisions.
+
+Empty latency and age series are returned as `null`, not zero. A resolution replay does not
+increment any value because it does not create another durable decision. The endpoint deliberately
+has no task-level dimensions: call IDs, case IDs, execution fences, worker/reconciler identities,
+provider references, and result digests are excluded. Production alert thresholds remain an
+operator policy—for example, a non-zero expired-lease count or an oldest age beyond the provider's
+lookup objective.
+
 Resolution retries are safe only when reconciler identity, both fences, decision and result identity
 match the committed receipt. A stale owner, expired lease, changed policy or conflicting resolution
 returns HTTP 409. An invalid provider response returns HTTP 422 and leaves the task leased so the
@@ -75,5 +93,7 @@ operator can correct or escalate it.
   absence, the reconciler must not choose `not_applied`.
 - SQLite and the provider remain separate systems. Provider idempotency keys are still the preferred
   first line of defense; this queue is the fail-closed recovery path.
-- Queue depth, oldest-task age, resolution latency and decision counts are not yet exported as
-  metrics. Those signals are the next observability increment.
+- The snapshot reports current database state; it does not retain a time series, page individual
+  tasks, or prove that an external metrics collector scraped it. Its exact aggregate scans the
+  retained reconciliation table; high-volume deployments need a retention policy or verified
+  rollup. Long-term rates and percentile latency require a trusted telemetry backend.

@@ -397,3 +397,123 @@ def test_api_claims_and_resolves_reconciliation_without_echoing_provider_value(
     assert resolved.status_code == 200
     assert resolved.json()["decision"] == "applied"
     assert provider_reference not in resolved.text
+
+
+def test_reconciliation_metrics_track_queue_age_expiry_and_reclaim(tmp_path: Path) -> None:
+    repository = OnboardingRepository(tmp_path / "metrics-lifecycle.db")
+    case_id, decision_sha256, _ = _admit_and_claim(repository)
+    _enqueue_expired(repository, case_id, decision_sha256)
+
+    queued = repository.tool_reconciliation_metrics(now=NOW + timedelta(seconds=35))
+    assert queued.queue_depth == 1
+    assert queued.queued_tasks == 1
+    assert queued.leased_tasks == 0
+    assert queued.oldest_unresolved_age_seconds == 4
+
+    first = repository.claim_tool_reconciliation(
+        reconciler_id="private-reconciler-a",
+        lease_seconds=10,
+        now=NOW + timedelta(seconds=35),
+    )
+    assert first is not None
+    expired = repository.tool_reconciliation_metrics(now=NOW + timedelta(seconds=46))
+    assert expired.queue_depth == 1
+    assert expired.leased_tasks == 1
+    assert expired.expired_leases == 1
+    assert expired.reclaimed_tasks == 0
+
+    reclaimed = repository.claim_tool_reconciliation(
+        reconciler_id="private-reconciler-b",
+        lease_seconds=10,
+        now=NOW + timedelta(seconds=46),
+    )
+    assert reclaimed is not None
+    snapshot = repository.tool_reconciliation_metrics(now=NOW + timedelta(seconds=47))
+    assert snapshot.expired_leases == 0
+    assert snapshot.reclaimed_tasks == 1
+    assert "private-reconciler" not in str(snapshot.to_dict())
+    assert "call-reconcile-1" not in str(snapshot.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("decision", "result", "applied", "not_applied"),
+    [
+        (
+            "applied",
+            {"status": "verified", "provider_reference": "private-provider-result"},
+            1,
+            0,
+        ),
+        ("not_applied", None, 0, 1),
+    ],
+)
+def test_reconciliation_metrics_derive_resolution_latency_and_decision_counts(
+    tmp_path: Path,
+    decision: str,
+    result: dict[str, str] | None,
+    applied: int,
+    not_applied: int,
+) -> None:
+    repository = OnboardingRepository(tmp_path / f"metrics-{decision}.db")
+    case_id, decision_sha256, execution_attempt = _admit_and_claim(repository)
+    _enqueue_expired(repository, case_id, decision_sha256)
+    task = repository.claim_tool_reconciliation(
+        reconciler_id="private-reconciler",
+        now=NOW + timedelta(seconds=31),
+    )
+    assert task is not None
+    repository.resolve_tool_reconciliation(
+        "call-reconcile-1",
+        execution_attempt=execution_attempt,
+        reconciliation_attempt=task.reconciliation_attempt,
+        reconciler_id="private-reconciler",
+        decision=decision,
+        policy=default_tool_policy(),
+        result=result,
+        now=NOW + timedelta(seconds=43),
+    )
+
+    metrics = repository.tool_reconciliation_metrics(now=NOW + timedelta(seconds=50))
+
+    assert metrics.queue_depth == 0
+    assert metrics.resolved_tasks == 1
+    assert metrics.applied_resolutions == applied
+    assert metrics.not_applied_resolutions == not_applied
+    assert metrics.oldest_unresolved_age_seconds is None
+    assert metrics.mean_resolution_latency_seconds == pytest.approx(12.0, abs=0.001)
+    assert metrics.max_resolution_latency_seconds == pytest.approx(12.0, abs=0.001)
+    assert "private" not in str(metrics.to_dict())
+
+
+def test_reconciliation_metrics_endpoint_is_stable_and_empty(tmp_path: Path) -> None:
+    api_module.repository = OnboardingRepository(tmp_path / "metrics-api.db")
+    api_module.review_queue = ReviewQueue(api_module.repository)
+
+    response = TestClient(api_module.app).get("/metrics/tool-reconciliation")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == 1
+    assert payload["queue_depth"] == 0
+    assert payload["queued_tasks"] == 0
+    assert payload["leased_tasks"] == 0
+    assert payload["expired_leases"] == 0
+    assert payload["reclaimed_tasks"] == 0
+    assert payload["resolved_tasks"] == 0
+    assert payload["applied_resolutions"] == 0
+    assert payload["not_applied_resolutions"] == 0
+    assert payload["oldest_unresolved_age_seconds"] is None
+    assert payload["mean_resolution_latency_seconds"] is None
+    assert payload["max_resolution_latency_seconds"] is None
+
+
+def test_reconciliation_metrics_fail_closed_on_inconsistent_durable_state(tmp_path: Path) -> None:
+    database = tmp_path / "metrics-corrupt.db"
+    repository = OnboardingRepository(database)
+    case_id, decision_sha256, _ = _admit_and_claim(repository)
+    _enqueue_expired(repository, case_id, decision_sha256)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE tool_reconciliations SET status = 'resolved', decision = NULL")
+
+    with pytest.raises(ValueError, match="source state is inconsistent"):
+        repository.tool_reconciliation_metrics(now=NOW + timedelta(seconds=40))
