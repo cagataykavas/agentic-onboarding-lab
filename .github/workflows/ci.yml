@@ -26,7 +26,7 @@ jobs:
           python -m venv /tmp/onboarding-wheel
           cd /tmp
           /tmp/onboarding-wheel/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl
-          /tmp/onboarding-wheel/bin/python -c "from service.api import app; assert app.title"
+          /tmp/onboarding-wheel/bin/python -c "from service.api import app; from service.reconciliation_alerts import evaluate_alerts; assert app.title and callable(evaluate_alerts)"
 
   container:
     runs-on: ubuntu-latest

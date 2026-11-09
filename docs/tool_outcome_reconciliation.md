@@ -74,7 +74,9 @@ increment any value because it does not create another durable decision. The end
 has no task-level dimensions: call IDs, case IDs, execution fences, worker/reconciler identities,
 provider references, and result digests are excluded. Production alert thresholds remain an
 operator policy—for example, a non-zero expired-lease count or an oldest age beyond the provider's
-lookup objective.
+lookup objective. The [reconciliation alert gate](reconciliation_alerts.md) validates this snapshot
+and applies reviewed queue, lease, age, latency, and freshness thresholds with machine-readable
+pass/alert/error exits.
 
 Resolution retries are safe only when reconciler identity, both fences, decision and result identity
 match the committed receipt. A stale owner, expired lease, changed policy or conflicting resolution
