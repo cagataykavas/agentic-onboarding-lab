@@ -61,6 +61,40 @@ def test_conflicting_address_routes_to_human():
     )
     assert result.stage is Stage.HUMAN_REVIEW
     assert case.human_review_required
+    recommendation = case.agent_recommendation
+    assert recommendation is not None
+    assert recommendation.outcome == "rejected"
+    assert recommendation.reason_codes == ("address_conflict",)
+    assert recommendation.evidence_ids == ("identity-1", "address-2")
+    assert recommendation.policy_version == "onboarding-policy-v1"
+    assert case.audit[-1].details["recommendation_id"] == recommendation.recommendation_id
+
+
+def test_reviewer_decision_is_paired_with_agent_recommendation():
+    agent = OnboardingAgent()
+    case = OnboardingCase("paired", "demo", "retail")
+    complete_identity(agent, case)
+    agent.update_profile(
+        case,
+        date_of_birth="1990-01-01",
+        country="Türkiye",
+        occupation="Engineer",
+        address="Ankara",
+    )
+    agent.add_address_evidence(case, address="Istanbul", confidence=0.90, conflict=True)
+    recommendation = case.agent_recommendation
+    assert recommendation is not None
+
+    agent.reviewer_decision(
+        case,
+        approve=True,
+        reason="Synthetic conflict resolved.",
+        recommendation_id=recommendation.recommendation_id,
+    )
+
+    decision = next(event for event in case.audit if event.event_type == "reviewer_decision")
+    assert decision.details["recommendation_id"] == recommendation.recommendation_id
+    assert decision.details["agreed_with_agent"] is False
 
 
 def test_audit_trail_records_stage_changes():

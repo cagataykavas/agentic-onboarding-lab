@@ -22,7 +22,11 @@ class JourneyMetrics:
     completed_cases: int
     completion_rate: float
     automated_approvals: int
+    agent_recommendations: int
     reviewer_decisions: int
+    paired_agent_human_decisions: int
+    agent_human_disagreements: int
+    agent_human_disagreement_rate: float | None
     human_review_rate: float
     average_evidence_per_case: float
     queued_reviews: int
@@ -60,6 +64,15 @@ class MetricsCalculator:
             for case in cases
         )
         evidence_count = sum(len(case.evidence) for case in cases)
+        recommendations = sum(case.agent_recommendation is not None for case in cases)
+        agreement_values = [
+            event.details.get("agreed_with_agent")
+            for case in cases
+            for event in case.audit
+            if event.event_type == "reviewer_decision"
+            and isinstance(event.details.get("agreed_with_agent"), bool)
+        ]
+        disagreements = sum(value is False for value in agreement_values)
         queued = sum(task.status == "queued" for task in review_tasks)
         leased = sum(task.status == "leased" for task in review_tasks)
         overdue = sum(
@@ -72,7 +85,13 @@ class MetricsCalculator:
             completed_cases=completed,
             completion_rate=completed / total if total else 0.0,
             automated_approvals=automated,
+            agent_recommendations=recommendations,
             reviewer_decisions=reviewed,
+            paired_agent_human_decisions=len(agreement_values),
+            agent_human_disagreements=disagreements,
+            agent_human_disagreement_rate=(
+                disagreements / len(agreement_values) if agreement_values else None
+            ),
             human_review_rate=escalated / total if total else 0.0,
             average_evidence_per_case=evidence_count / total if total else 0.0,
             queued_reviews=queued,

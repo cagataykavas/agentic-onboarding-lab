@@ -56,6 +56,7 @@ class ReviewerDecisionRequest(BaseModel):
     approve: bool
     reason: str = Field(min_length=5, max_length=1000)
     reviewer: str = Field(default="reviewer-demo", min_length=2, max_length=120)
+    recommendation_id: str = Field(min_length=8, max_length=200)
 
 
 class ClaimReviewRequest(BaseModel):
@@ -68,7 +69,7 @@ repository = OnboardingRepository(DATABASE_PATH)
 review_queue = ReviewQueue(repository)
 app = FastAPI(
     title="Agentic Onboarding Platform",
-    version="0.3.0",
+    version="0.4.0",
     description="Policy-bounded onboarding workflow with explicit human escalation and audit trails.",
 )
 
@@ -272,7 +273,10 @@ def review(
     result = _mutate(
         case_id,
         lambda case: _agent_for(case).reviewer_decision(
-            case, approve=request.approve, reason=request.reason
+            case,
+            approve=request.approve,
+            reason=request.reason,
+            recommendation_id=request.recommendation_id,
         ),
         if_match,
         idempotency_key,

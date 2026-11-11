@@ -10,6 +10,7 @@ from pathlib import Path
 
 from onboarding import (
     Actor,
+    AgentRecommendation,
     AuditEvent,
     EvidenceRecord,
     EvidenceStatus,
@@ -86,6 +87,21 @@ def case_to_dict(case: OnboardingCase) -> dict:
 
 
 def case_from_dict(payload: dict) -> OnboardingCase:
+    recommendation_payload = payload.get("agent_recommendation")
+    recommendation = (
+        AgentRecommendation(
+            recommendation_id=recommendation_payload["recommendation_id"],
+            outcome=recommendation_payload["outcome"],
+            reason_codes=tuple(recommendation_payload.get("reason_codes", [])),
+            evidence_ids=tuple(recommendation_payload.get("evidence_ids", [])),
+            case_version=int(recommendation_payload["case_version"]),
+            policy_version=recommendation_payload["policy_version"],
+            planner_version=recommendation_payload["planner_version"],
+            generated_at=recommendation_payload["generated_at"],
+        )
+        if recommendation_payload is not None
+        else None
+    )
     evidence = [
         EvidenceRecord(
             evidence_id=row["evidence_id"],
@@ -124,6 +140,7 @@ def case_from_dict(payload: dict) -> OnboardingCase:
         requested_fields=list(payload.get("requested_fields", [])),
         risk_flags=set(payload.get("risk_flags", [])),
         human_review_required=bool(payload.get("human_review_required", False)),
+        agent_recommendation=recommendation,
         decision_reason=payload.get("decision_reason"),
         decision_outcome=payload.get("decision_outcome"),
         audit=audit,
