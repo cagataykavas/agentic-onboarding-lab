@@ -1,11 +1,21 @@
 from datetime import UTC, datetime, timedelta
 
-from onboarding import Actor, AuditEvent, EvidenceRecord, EvidenceStatus, OnboardingCase, Stage
+from onboarding import (
+    Actor,
+    AgentRecommendation,
+    AuditEvent,
+    EvidenceRecord,
+    EvidenceStatus,
+    OnboardingCase,
+    Stage,
+)
 from service.metrics import MetricsCalculator
 from service.reviews import ReviewTask
 
 
-def event(case_id: str, event_type: str) -> AuditEvent:
+def event(
+    case_id: str, event_type: str, details: dict[str, object] | None = None
+) -> AuditEvent:
     return AuditEvent(
         event_id=1,
         case_id=case_id,
@@ -14,7 +24,7 @@ def event(case_id: str, event_type: str) -> AuditEvent:
         stage_before=Stage.RISK_SCREENING,
         stage_after=Stage.COMPLETED,
         timestamp="2026-01-01T00:00:00+00:00",
-        details={},
+        details=details or {},
     )
 
 
@@ -35,6 +45,19 @@ def test_metrics_are_derived_from_audit_history_and_queue_sla() -> None:
     )
     escalated = OnboardingCase("b", "account", "retail", stage=Stage.HUMAN_REVIEW)
     escalated.audit.append(event("b", "case_escalated"))
+    escalated.agent_recommendation = AgentRecommendation(
+        recommendation_id="REC-b-0001",
+        outcome="rejected",
+        reason_codes=("identity_conflict",),
+        evidence_ids=(),
+        case_version=1,
+        policy_version="onboarding-policy-v1",
+        planner_version="deterministic-review-recommender-v1",
+        generated_at=now.isoformat(),
+    )
+    escalated.audit.append(
+        event("b", "reviewer_decision", {"agreed_with_agent": False})
+    )
     task = ReviewTask(
         case_id="b",
         status="queued",
@@ -49,6 +72,19 @@ def test_metrics_are_derived_from_audit_history_and_queue_sla() -> None:
     assert metrics.completion_rate == 0.5
     assert metrics.human_review_rate == 0.5
     assert metrics.automated_approvals == 1
+    assert metrics.agent_recommendations == 1
+    assert metrics.reviewer_decisions == 1
+    assert metrics.paired_agent_human_decisions == 1
+    assert metrics.agent_human_disagreements == 1
+    assert metrics.agent_human_disagreement_rate == 1.0
     assert metrics.average_evidence_per_case == 0.5
     assert metrics.overdue_reviews == 1
     assert metrics.stage_counts == {"completed": 1, "human_review": 1}
+
+
+def test_disagreement_rate_is_unknown_without_paired_decisions() -> None:
+    metrics = MetricsCalculator().calculate([], [])
+
+    assert metrics.paired_agent_human_decisions == 0
+    assert metrics.agent_human_disagreements == 0
+    assert metrics.agent_human_disagreement_rate is None

@@ -59,6 +59,18 @@ class AuditEvent:
     details: dict[str, object]
 
 
+@dataclass(frozen=True)
+class AgentRecommendation:
+    recommendation_id: str
+    outcome: str
+    reason_codes: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    case_version: int
+    policy_version: str
+    planner_version: str
+    generated_at: str
+
+
 @dataclass
 class OnboardingCase:
     case_id: str
@@ -71,6 +83,7 @@ class OnboardingCase:
     requested_fields: list[str] = field(default_factory=list)
     risk_flags: set[str] = field(default_factory=set)
     human_review_required: bool = False
+    agent_recommendation: AgentRecommendation | None = None
     decision_reason: str | None = None
     decision_outcome: str | None = None
     version: int = 0
@@ -96,6 +109,7 @@ class TransitionResult:
 
 
 class OnboardingPolicy:
+    POLICY_VERSION = "onboarding-policy-v1"
     REQUIRED_PROFILE_FIELDS = (
         "full_name",
         "date_of_birth",
@@ -159,6 +173,8 @@ class OnboardingAgent:
     cannot silently bypass mandatory review or evidence requirements.
     """
 
+    PLANNER_VERSION = "deterministic-review-recommender-v1"
+
     def __init__(self, policy: OnboardingPolicy | None = None) -> None:
         self.policy = policy or OnboardingPolicy()
         self._event_counter = 0
@@ -209,6 +225,45 @@ class OnboardingAgent:
             after=stage,
             details=details,
         )
+
+    def _recommend_for_review(self, case: OnboardingCase) -> AgentRecommendation:
+        if case.agent_recommendation is not None:
+            return case.agent_recommendation
+
+        reason_codes = set(case.risk_flags)
+        reason_codes.update(
+            f"{item.kind}_conflict"
+            for item in case.evidence
+            if item.status is EvidenceStatus.CONFLICT
+        )
+        if not reason_codes:
+            reason_codes.add("manual_review_required")
+        case.agent_recommendation = AgentRecommendation(
+            recommendation_id=f"REC-{case.case_id}-{len(case.audit) + 1:04d}",
+            outcome="rejected",
+            reason_codes=tuple(sorted(reason_codes)),
+            evidence_ids=tuple(item.evidence_id for item in case.evidence),
+            case_version=case.version,
+            policy_version=self.policy.POLICY_VERSION,
+            planner_version=self.PLANNER_VERSION,
+            generated_at=self._now(),
+        )
+        return case.agent_recommendation
+
+    def _escalate(self, case: OnboardingCase, message: str) -> TransitionResult:
+        recommendation = self._recommend_for_review(case)
+        self._transition(
+            case,
+            Stage.HUMAN_REVIEW,
+            actor=Actor.SYSTEM,
+            event_type="case_escalated",
+            details={
+                "risk_flags": sorted(case.risk_flags),
+                "recommendation_id": recommendation.recommendation_id,
+                "recommended_outcome": recommendation.outcome,
+            },
+        )
+        return TransitionResult(case.stage, message, "human_review")
 
     def capture_consent(self, case: OnboardingCase, accepted: bool) -> TransitionResult:
         if case.stage is not Stage.STARTED:
@@ -384,17 +439,9 @@ class OnboardingAgent:
         # Conflicting evidence is itself the reason to defer. Requiring it to pass
         # normal validation first would strand the case before the review route.
         if self.policy.requires_human_review(case):
-            self._transition(
+            return self._escalate(
                 case,
-                Stage.HUMAN_REVIEW,
-                actor=Actor.SYSTEM,
-                event_type="case_escalated",
-                details={"risk_flags": sorted(case.risk_flags)},
-            )
-            return TransitionResult(
-                case.stage,
                 "A specialist will review the conflicting evidence.",
-                "human_review",
             )
 
         if not self.policy.address_valid(case):
@@ -425,17 +472,9 @@ class OnboardingAgent:
             case.risk_flags.add("enhanced_due_diligence")
 
         if self.policy.requires_human_review(case):
-            self._transition(
+            return self._escalate(
                 case,
-                Stage.HUMAN_REVIEW,
-                actor=Actor.SYSTEM,
-                event_type="case_escalated",
-                details={"risk_flags": sorted(case.risk_flags)},
-            )
-            return TransitionResult(
-                case.stage,
                 "A specialist will review the information before we complete onboarding.",
-                "human_review",
             )
 
         self._transition(
@@ -454,11 +493,17 @@ class OnboardingAgent:
         *,
         approve: bool,
         reason: str,
+        recommendation_id: str,
     ) -> TransitionResult:
         if case.stage is not Stage.HUMAN_REVIEW:
             raise ValueError("case is not awaiting human review")
 
+        recommendation = case.agent_recommendation
+        if recommendation is None or recommendation.recommendation_id != recommendation_id:
+            raise ValueError("review decision does not match the current agent recommendation")
+
         final_stage = Stage.APPROVED if approve else Stage.REJECTED
+        agreed_with_agent = recommendation.outcome == ("approved" if approve else "rejected")
         case.decision_reason = reason
         case.decision_outcome = "approved" if approve else "rejected"
         self._transition(
@@ -466,7 +511,12 @@ class OnboardingAgent:
             final_stage,
             actor=Actor.REVIEWER,
             event_type="reviewer_decision",
-            details={"approve": approve, "reason": reason},
+            details={
+                "approve": approve,
+                "reason": reason,
+                "recommendation_id": recommendation.recommendation_id,
+                "agreed_with_agent": agreed_with_agent,
+            },
         )
         return self.complete(case)
 

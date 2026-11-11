@@ -84,6 +84,9 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
     )
     assert result.status_code == 200
     assert result.json()["case"]["stage"] == "human_review"
+    recommendation = result.json()["case"]["agent_recommendation"]
+    assert recommendation["outcome"] == "rejected"
+    assert recommendation["case_version"] == 4
 
     queued = client.get("/reviews/queue")
     assert queued.status_code == 200
@@ -100,10 +103,23 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
             "approve": False,
             "reason": "A different analyst must not decide leased work.",
             "reviewer": "analyst-2",
+            "recommendation_id": recommendation["recommendation_id"],
         },
     )
     assert unauthorized.status_code == 409
     assert client.get(f"/cases/{case_id}").json()["stage"] == "human_review"
+
+    stale_recommendation = client.post(
+        f"/cases/{case_id}/review",
+        json={
+            "approve": True,
+            "reason": "This decision references a stale recommendation.",
+            "reviewer": "analyst-1",
+            "recommendation_id": "REC-stale-0001",
+        },
+    )
+    assert stale_recommendation.status_code == 409
+    assert "current agent recommendation" in stale_recommendation.json()["detail"]
 
     reviewed = client.post(
         f"/cases/{case_id}/review",
@@ -111,11 +127,23 @@ def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
             "approve": True,
             "reason": "Synthetic conflict was manually resolved.",
             "reviewer": "analyst-1",
+            "recommendation_id": recommendation["recommendation_id"],
         },
     )
     assert reviewed.status_code == 200
     assert reviewed.json()["case"]["stage"] == "completed"
     assert reviewed.json()["case"]["decision_outcome"] == "approved"
+    decision = next(
+        event
+        for event in reviewed.json()["case"]["audit"]
+        if event["event_type"] == "reviewer_decision"
+    )
+    assert decision["details"]["recommendation_id"] == recommendation["recommendation_id"]
+    assert decision["details"]["agreed_with_agent"] is False
+    metrics = client.get("/metrics/journey").json()
+    assert metrics["paired_agent_human_decisions"] == 1
+    assert metrics["agent_human_disagreements"] == 1
+    assert metrics["agent_human_disagreement_rate"] == 1.0
     assert client.get("/reviews/queue").json() == []
 
 

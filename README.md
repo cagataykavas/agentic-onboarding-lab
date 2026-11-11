@@ -97,7 +97,9 @@ This implementation treats a state transition as a command, not a CRUD overwrite
 - state and the embedded audit event commit in the same SQLite transaction;
 - `Idempotency-Key` receipts make timeout retries safe without duplicate evidence or audit events;
 - escalation creates a durable review task in the same case transaction;
+- escalation snapshots a versioned, privacy-reduced agent recommendation before review;
 - reviewers claim work through expiring leases, so abandoned tasks re-enter the queue;
+- reviewer decisions are paired to that snapshot for reproducible agreement monitoring;
 - queue order is deterministic: priority descending, then SLA deadline, then arrival time;
 - outcome is stored separately from the terminal `completed` stage.
 
@@ -119,8 +121,23 @@ command receipt and lease acquisition map directly to conditional updates and ro
 
 `GET /metrics/journey` derives its current snapshot from case audit histories and durable queue
 records. It reports completion and human-review rates, automated/reviewer decisions, evidence
-density, stage distribution, queued/leased work and SLA breaches. Metrics are recomputable rather
+density, stage distribution, queued/leased work, SLA breaches, and paired agent/human disagreement.
+The disagreement rate is `null` until at least one reviewer decision is paired to a recommendation;
+the service does not report an invented zero for an empty sample. Metrics are recomputable rather
 than increment-only counters that drift after retries.
+
+## Paired oversight evidence
+
+When policy routes a case to human review, the deterministic reference agent stores one immutable
+recommendation snapshot containing the proposed outcome, reason codes, evidence identifiers, input
+case version, policy version, planner version, and timestamp. It intentionally excludes evidence
+values and customer profile values. The reviewer remains authoritative, and the decision command
+must acknowledge the current recommendation ID before agreement is recorded.
+
+This is an operational monitoring signal, not a model-quality claim. A high agreement rate can
+reflect automation bias or an unrepresentative queue, while disagreement can reflect either a weak
+recommendation or valuable human correction. Production use still needs sampled case review,
+outcome analysis, and segment-level bias checks.
 
 ## API workflow
 
