@@ -100,6 +100,8 @@ This implementation treats a state transition as a command, not a CRUD overwrite
 - reviewers claim work through expiring leases, so abandoned tasks re-enter the queue;
 - queue order is deterministic: priority descending, then SLA deadline, then arrival time;
 - outcome is stored separately from the terminal `completed` stage.
+- every agent or system audit event embeds the canonical policy snapshot and its SHA-256 digest;
+- `GET /policy/provenance` exposes the non-secret policy currently used by the service.
 
 These boundaries remain useful if SQLite is replaced by PostgreSQL: the compare-and-swap update,
 command receipt and lease acquisition map directly to conditional updates and row locking.
@@ -145,6 +147,19 @@ curl -s -X POST localhost:8000/reviews/claim \
 
 A repeated idempotency key returns `idempotent_replay: true`. A stale version, reused key from
 another case, illegal state transition or invalid reviewer lease returns HTTP 409.
+
+## Policy provenance
+
+Automated events carry a `policy_provenance` object containing the policy schema, deployment
+version, confidence thresholds, sorted mandatory-review flags and a digest of that canonical
+configuration. This makes a stored decision independently comparable with the service's active
+policy and prevents caller-supplied event details from replacing the provenance field. Customer
+and reviewer events are not labelled as automated policy decisions.
+
+The digest is an integrity identifier, not a digital signature or proof that a policy was
+approved. A production deployment should load versioned policy from a controlled registry, retain
+historical definitions, sign approved artifacts and alert when a configured version is reused with
+a different digest. The next increment would reject such version-to-digest drift during startup.
 
 ## Repository layout
 
