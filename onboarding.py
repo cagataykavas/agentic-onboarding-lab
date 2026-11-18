@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -96,6 +99,7 @@ class TransitionResult:
 
 
 class OnboardingPolicy:
+    PROVENANCE_SCHEMA = "onboarding-policy/v1"
     REQUIRED_PROFILE_FIELDS = (
         "full_name",
         "date_of_birth",
@@ -114,10 +118,59 @@ class OnboardingPolicy:
             "ownership_conflict",
             "high_risk_country",
         ),
+        policy_version: str = "2026-11-18",
     ) -> None:
-        self.minimum_identity_confidence = minimum_identity_confidence
-        self.minimum_address_confidence = minimum_address_confidence
-        self.mandatory_review_flags = set(mandatory_review_flags)
+        self.minimum_identity_confidence = self._confidence_threshold(
+            "minimum_identity_confidence", minimum_identity_confidence
+        )
+        self.minimum_address_confidence = self._confidence_threshold(
+            "minimum_address_confidence", minimum_address_confidence
+        )
+        if not isinstance(policy_version, str) or not policy_version.strip():
+            raise ValueError("policy_version must be a non-empty string")
+        if len(policy_version.strip()) > 128:
+            raise ValueError("policy_version must be at most 128 characters")
+        if isinstance(mandatory_review_flags, str):
+            raise TypeError("mandatory_review_flags must be an iterable of flag names")
+        normalized_flags = set()
+        for flag in mandatory_review_flags:
+            if not isinstance(flag, str) or not flag.strip():
+                raise ValueError("mandatory_review_flags must contain non-empty strings")
+            normalized_flags.add(flag.strip())
+
+        self.mandatory_review_flags = normalized_flags
+        self.policy_version = policy_version.strip()
+
+    @staticmethod
+    def _confidence_threshold(name: str, value: float) -> float:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be a number between 0 and 1")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"{name} must be a number between 0 and 1") from exc
+        if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+            raise ValueError(f"{name} must be a finite number between 0 and 1")
+        return normalized
+
+    def configuration(self) -> dict[str, object]:
+        """Return the canonical, non-secret policy inputs used for decisions."""
+        return {
+            "schema": self.PROVENANCE_SCHEMA,
+            "policy_version": self.policy_version,
+            "minimum_identity_confidence": self.minimum_identity_confidence,
+            "minimum_address_confidence": self.minimum_address_confidence,
+            "mandatory_review_flags": sorted(self.mandatory_review_flags),
+        }
+
+    def provenance(self) -> dict[str, object]:
+        """Return a reproducible snapshot and digest for audit binding."""
+        configuration = self.configuration()
+        canonical = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
+        return {
+            "digest": f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}",
+            "configuration": configuration,
+        }
 
     def missing_profile_fields(self, case: OnboardingCase) -> list[str]:
         return [
@@ -177,6 +230,10 @@ class OnboardingAgent:
         details: dict[str, object] | None = None,
     ) -> None:
         self._event_counter += 1
+        audit_details = dict(details or {})
+        if actor in {Actor.AGENT, Actor.SYSTEM}:
+            # Reserved provenance cannot be overridden by caller-provided details.
+            audit_details["policy_provenance"] = self.policy.provenance()
         case.audit.append(
             AuditEvent(
                 event_id=self._event_counter,
@@ -186,7 +243,7 @@ class OnboardingAgent:
                 stage_before=before,
                 stage_after=after,
                 timestamp=self._now(),
-                details=details or {},
+                details=audit_details,
             )
         )
 

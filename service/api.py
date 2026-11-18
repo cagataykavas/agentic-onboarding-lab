@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from onboarding import OnboardingAgent, OnboardingCase, Stage
+from onboarding import OnboardingAgent, OnboardingCase, OnboardingPolicy, Stage
 from service.metrics import MetricsCalculator
 from service.reviews import ReviewQueue
 from service.store import (
@@ -66,6 +66,7 @@ class ClaimReviewRequest(BaseModel):
 DATABASE_PATH = Path(os.getenv("ONBOARDING_DATABASE_PATH", "onboarding.db"))
 repository = OnboardingRepository(DATABASE_PATH)
 review_queue = ReviewQueue(repository)
+active_policy = OnboardingPolicy()
 app = FastAPI(
     title="Agentic Onboarding Platform",
     version="0.3.0",
@@ -81,7 +82,7 @@ def _load(case_id: str) -> OnboardingCase:
 
 
 def _agent_for(case: OnboardingCase) -> OnboardingAgent:
-    agent = OnboardingAgent()
+    agent = OnboardingAgent(active_policy)
     agent._event_counter = max((event.event_id for event in case.audit), default=0)
     return agent
 
@@ -134,6 +135,12 @@ def _mutate(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/policy/provenance")
+def policy_provenance() -> dict[str, object]:
+    """Expose the exact non-secret policy snapshot bound to automated audit events."""
+    return active_policy.provenance()
 
 
 @app.get("/metrics/journey")

@@ -57,6 +57,26 @@ def test_happy_path_onboarding(tmp_path: Path) -> None:
     assert len(audit.json()) >= 5
 
 
+def test_policy_provenance_is_exposed_and_persisted_with_automated_events(
+    tmp_path: Path,
+) -> None:
+    client = client_for(tmp_path)
+    policy = client.get("/policy/provenance")
+    assert policy.status_code == 200
+    provenance = policy.json()
+    assert provenance["digest"].startswith("sha256:")
+    assert provenance["configuration"]["policy_version"]
+
+    case_id = client.post("/cases", json={}).json()["case_id"]
+    transitioned = client.post(f"/cases/{case_id}/consent", json={"accepted": True})
+    assert transitioned.status_code == 200
+
+    stored = client.get(f"/cases/{case_id}").json()
+    customer_event, agent_event = stored["audit"]
+    assert "policy_provenance" not in customer_event["details"]
+    assert agent_event["details"]["policy_provenance"] == provenance
+
+
 def test_conflict_routes_to_human_review(tmp_path: Path) -> None:
     client = client_for(tmp_path)
     case_id = client.post("/cases", json={}).json()["case_id"]
